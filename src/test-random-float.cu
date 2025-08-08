@@ -13,7 +13,7 @@
 
 void fill_random(float* matrix, int n) {
     for (int i = 0; i < n * n; ++i)
-        matrix[i] = static_cast<float>(rand() % 10); // 0–9
+        matrix[i] = static_cast<float>(rand() % 100); // 0–9
 }
 
 void initialize_identity_mask(int* X, int n) {
@@ -33,7 +33,8 @@ void compute_V_from_C_and_X(const float* C, const int* X, float* V, int n) {
     }
 }
 
-void print_matrix(const float* matrix, int n, const char* name) {
+template <typename T>
+void print_matrix(const T* matrix, int n, const char* name) {
     std::cout << name << " (" << n << "x" << n << "):\n";
     for (int i = 0; i < n; ++i) {
         for (int j = 0; j < n; ++j)
@@ -43,6 +44,7 @@ void print_matrix(const float* matrix, int n, const char* name) {
     std::cout << std::endl;
 }
 
+
 void print_vector(const float* vec, int n, const char* name) {
     std::cout << name << " (" << n << "): ";
     for (int i = 0; i < n; ++i)
@@ -50,8 +52,25 @@ void print_vector(const float* vec, int n, const char* name) {
     std::cout << "\n\n";
 }
 
-int main() {
-    const int n = 10;
+int main(int argc, char* argv[]) {
+    int n = 100; // default
+
+    if (argc >= 2) {
+        if (std::string(argv[1]) == "-n") {
+            if (argc >= 3) {
+                n = std::atoi(argv[2]);
+            } else {
+                std::cerr << "Error: -n requires a value.\n";
+                return 1;
+            }
+        } else {
+            n = std::atoi(argv[1]); // simple style
+        }
+    }
+
+    // std::cout << "Matrix size n = " << n << std::endl;
+    std::cout << "Matrix size n = " << n << std::endl;
+
     size_t matSize = n * n * sizeof(float);
     size_t maskSize = n * n * sizeof(int);
     size_t vecSize = n * sizeof(float);
@@ -72,7 +91,8 @@ int main() {
 
     // Print initialized values
     print_matrix(h_C, n, "Matrix C");
-    print_matrix(reinterpret_cast<float*>(h_X), n, "Mask X");
+    // print_matrix(reinterpret_cast<float*>(h_X), n, "Mask X");
+    print_matrix(h_X, n, "Mask X");
     print_vector(h_U, n, "Vector U");
     print_vector(h_V, n, "Vector V");
 
@@ -91,13 +111,42 @@ int main() {
     cudaMemcpy(d_V, h_V, vecSize, cudaMemcpyHostToDevice);
 
     // Call solver
+    // solve(d_C, d_X, d_U, d_V, n);
+    // verify_solution(d_C, d_X, d_U, d_V, n);
+
+    // Create CUDA events
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    float elapsed_ms = 0.0f;
+
+    // ---- Time solve() ----
+    cudaEventRecord(start);
     solve(d_C, d_X, d_U, d_V, n);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&elapsed_ms, start, stop);
+    std::cout << "solve() time: " << elapsed_ms << " ms" << std::endl;
+
+    // ---- Time verify_solution() ----
+    cudaEventRecord(start);
     verify_solution(d_C, d_X, d_U, d_V, n);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&elapsed_ms, start, stop);
+    std::cout << "verify_solution() time: " << elapsed_ms << " ms" << std::endl;
+
+    // Destroy events after use
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
 
     cudaMemcpy(h_X, d_X, maskSize, cudaMemcpyDeviceToHost);
-    print_matrix(reinterpret_cast<float*>(h_X), n, "Mask X");
-    print_vector(h_U, n, "Vector U");
-    print_vector(h_V, n, "Vector V");
+    // print_matrix(reinterpret_cast<float*>(h_X), n, "Mask X");
+    // print_matrix(h_X, n, "Mask X");
+    // print_vector(h_U, n, "Vector U");
+    // print_vector(h_V, n, "Vector V");
 
 
     // Cleanup

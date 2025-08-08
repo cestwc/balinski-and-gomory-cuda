@@ -1,33 +1,16 @@
-#include <cuda_runtime.h>
-// #include <iostream>
+#include <iostream>
 // #include <cstdlib>
 // #include <ctime>
-
-// CUDA kernel for matrix multiplication
-__global__ void matrix_multiplication_kernel(const float* A, const float* B, float* C, int M, int N, int K) {
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (row < M && col < K) {
-        float sum = 0.0f;
-        for (int i = 0; i < N; ++i) {
-            sum += A[row * N + i] * B[i * K + col];
-        }
-        C[row * K + col] = sum;
-    }
-}
-
-#include <iostream>
-#include <cstdlib>
-#include <ctime>
 #include <cuda_runtime.h>
+#include <float.h>
+#include <cub/cub.cuh>
+
 
 // Forward declaration
 // void solve(float* d_C, int* d_X, float* d_U, float* d_V, int n);
-#include <cuda_runtime.h>
-#include <device_launch_parameters.h>
-#include <iostream>
-#include <float.h>
+// #include <cuda_runtime.h>
+// #include <device_launch_parameters.h>
+// #include <iostream>
 
 #define IDX2C(i,j,n) ((j)*(n)+(i))
 // #define IDX2C(i,j,n) ((i)*(n)+(j))
@@ -128,15 +111,14 @@ __global__ void solve_1bc_kernel(
 void solve_1bc(
     int n,
     int* d_col_to_row,
-    int k,
-    int l,
+    int* k,            // now pointer
+    int* l,            // now pointer (not used here, but kept for symmetry)
     float* d_B,
     int* d_R,
     int* d_Q
 ){
-
-    dim3 threadsPerBlock(16, 16); // 16x16 = 256 threads per block
-    dim3 numBlocks((n + 15) / 16, (n + 15) / 16); // ceil(n / 16) in each dimension
+    dim3 threadsPerBlock(16, 16);
+    dim3 numBlocks((n + 15) / 16, (n + 15) / 16);
 
     bool h_changed;
     bool* d_changed;
@@ -145,15 +127,19 @@ void solve_1bc(
     do {
         h_changed = false;
         cudaMemcpy(d_changed, &h_changed, sizeof(bool), cudaMemcpyHostToDevice);
+
+        // NOTE: kernel takes k by value — pass *k
         solve_1bc_kernel<<<numBlocks, threadsPerBlock>>>(
-            n, d_col_to_row, k, d_B, d_R, d_Q, d_changed
+            n, d_col_to_row, *k, d_B, d_R, d_Q, d_changed
         );
+
         cudaMemcpy(&h_changed, d_changed, sizeof(bool), cudaMemcpyDeviceToHost);
         cudaDeviceSynchronize();
     } while (h_changed);
 
     cudaFree(d_changed);
 }
+
 
 
 __global__ void set_array_value(int* arr, int value, int n) {
@@ -171,7 +157,7 @@ __global__ void update_duals(int* R, int* Q, float* U, float* V, float epsilon, 
 
 bool solve_from_kl(
     int n,
-    float* d_C, int* d_X, int k, int l,
+    float* d_C, int* d_X, int* k, int* l, // now k and l are pointers
     float* d_U, float* d_V, float* d_B
 ) {
     // Allocate and initialize R and Q
@@ -182,8 +168,8 @@ bool solve_from_kl(
     set_array_value<<<(n + 255)/256, 256>>>(d_R, n, n);
     set_array_value<<<(n + 255)/256, 256>>>(d_Q, n, n);
 
-    // Q[l] = k
-    cudaMemcpy(&d_Q[l], &k, sizeof(int), cudaMemcpyHostToDevice);
+    // Q[*l] = *k
+    cudaMemcpy(&d_Q[*l], k, sizeof(int), cudaMemcpyHostToDevice);
 
     // Step 1: Solve 1BC
     int* d_col_to_row;
@@ -196,13 +182,13 @@ bool solve_from_kl(
     }
     cudaFree(d_col_to_row);
 
-    // Step 2: Check if R[k] != n and R[k] != l
+    // Step 2: Check if R[*k] != n and R[*k] != *l
     int h_Rk;
-    cudaMemcpy(&h_Rk, &d_R[k], sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&h_Rk, &d_R[*k], sizeof(int), cudaMemcpyDeviceToHost);
 
-    if (h_Rk != n && h_Rk != l) {
-        int k_ = k;
-        int l_ = l;
+    if (h_Rk != n && h_Rk != *l) {
+        int k_ = *k;
+        int l_ = *l;
 
         int h_R, h_Q;
 
@@ -225,55 +211,50 @@ bool solve_from_kl(
             cudaMemcpy(&h_Q, &d_Q[l_], sizeof(int), cudaMemcpyDeviceToHost);
             k_ = h_Q;
 
-            if (k_ == k && l_ == l)
+            if (k_ == *k && l_ == *l)
                 break;
         }
-        
 
         float b_kl;
-        cudaMemcpy(&b_kl, &d_B[IDX2C(k, l, n)], sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&b_kl, &d_B[IDX2C(*k, *l, n)], sizeof(float), cudaMemcpyDeviceToHost);
         float epsilon = -b_kl;
 
         float v_l;
-        cudaMemcpy(&v_l, &d_V[l], sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&v_l, &d_V[*l], sizeof(float), cudaMemcpyDeviceToHost);
         v_l -= epsilon;
-        cudaMemcpy(&d_V[l], &v_l, sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(&d_V[*l], &v_l, sizeof(float), cudaMemcpyHostToDevice);
 
         // Recompute B = C - U.unsqueeze(1) - V
         dim3 threads(16, 16);
         dim3 blocks((n + 15) / 16, (n + 15) / 16);
         compute_B<<<blocks, threads>>>(d_C, d_U, d_V, d_B, n);
 
-        float* h_B = new float[n * n];
-        cudaMemcpy(h_B, d_B, sizeof(float) * n * n, cudaMemcpyDeviceToHost);
+        *k = n;
+        *l = n;
 
-        int min_idx = 0;
-        float min_val = h_B[0];
-        for (int idx = 1; idx < n * n; ++idx) {
-            if (h_B[idx] < min_val) {
-                min_val = h_B[idx];
-                min_idx = idx;
-            }
-        }
-        delete[] h_B;
+        // float* h_B = new float[n * n];
+        // cudaMemcpy(h_B, d_B, sizeof(float) * n * n, cudaMemcpyDeviceToHost);
+        // int min_idx = 0;
+        // float min_val = h_B[0];
+        // for (int idx = 1; idx < n * n; ++idx) {
+        //     if (h_B[idx] < min_val) {
+        //         min_val = h_B[idx];
+        //         min_idx = idx;
+        //     }
+        // }
+        // delete[] h_B;
+        // // Update k, l in-place
+        // *k = min_idx % n;
+        // *l = min_idx / n;
 
-        // Update k, l in-place
-        k = min_idx % n;
-        l = min_idx / n;
-
-        // cudaFree(d_R);
-        // cudaFree(d_Q);
-        // return false;
         cudaFree(d_R);
         cudaFree(d_Q);
-        return solve_from_kl(n, d_C, d_X, k, l, d_U, d_V, d_B);  // recursion
-
+        return true;
     }
 
     // Branch B: find epsilon satisfying mask
     float epsilon = -1;
     bool found = false;
-    // int i_found = -1, j_found = -1;
 
     for (int i = 0; i < n; ++i) {
         int r_val;
@@ -289,8 +270,6 @@ bool solve_from_kl(
             cudaMemcpy(&b_ij, &d_B[IDX2C(i, j, n)], sizeof(float), cudaMemcpyDeviceToHost);
             if (b_ij >= 0 && (!found || b_ij < epsilon)) {
                 epsilon = b_ij;
-                // i_found = i;
-                // j_found = j;
                 found = true;
             }
         }
@@ -298,31 +277,27 @@ bool solve_from_kl(
 
     if (!found) {
         float b_kl;
-        cudaMemcpy(&b_kl, &d_B[IDX2C(k, l, n)], sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&b_kl, &d_B[IDX2C(*k, *l, n)], sizeof(float), cudaMemcpyDeviceToHost);
         epsilon = -b_kl;
     }
 
     // Update duals
     update_duals<<<(n + 255) / 256, 256>>>(d_R, d_Q, d_U, d_V, epsilon, n);
 
-    // Recompute B = C - U.unsqueeze(1) - V
+    // Recompute B
     dim3 threads(16, 16);
     dim3 blocks((n + 15) / 16, (n + 15) / 16);
     compute_B<<<blocks, threads>>>(d_C, d_U, d_V, d_B, n);
     cudaDeviceSynchronize();
 
-    // Check B[k,l]
+    // Check B[*k,*l]
     float b_kl_check;
-    cudaMemcpy(&b_kl_check, &d_B[IDX2C(k, l, n)], sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&b_kl_check, &d_B[IDX2C(*k, *l, n)], sizeof(float), cudaMemcpyDeviceToHost);
 
     if (b_kl_check < 0) {
-        // cudaFree(d_R);
-        // cudaFree(d_Q);
-        // return true;
         cudaFree(d_R);
         cudaFree(d_Q);
-        return solve_from_kl(n, d_C, d_X, k, l, d_U, d_V, d_B);  // recursion
-
+        return true;
     }
 
     // Check if any B[i,j] < 0
@@ -333,19 +308,21 @@ bool solve_from_kl(
             cudaMemcpy(&b_ij, &d_B[IDX2C(i, j, n)], sizeof(float), cudaMemcpyDeviceToHost);
             if (b_ij < 0) {
                 any_negative = true;
-                // break;
                 cudaFree(d_R);
                 cudaFree(d_Q);
-                return solve_from_kl(n, d_C, d_X, i, j, d_U, d_V, d_B);  // recursion
+                *k = i;
+                *l = j;
+                return true;
             }
         }
     }
 
     cudaFree(d_R);
     cudaFree(d_Q);
-    return any_negative;
+    return false;
 }
 
+// using KVP = cub::KeyValuePair<int, float>;
 
 
 void solve(float* d_C, int* d_X, float* d_U, float* d_V, int n) {
@@ -365,27 +342,50 @@ void solve(float* d_C, int* d_X, float* d_U, float* d_V, int n) {
     dim3 blocks((n + 15) / 16, (n + 15) / 16);
     compute_B<<<blocks, threads>>>(d_C, d_U, d_V, d_B, n);
 
+    const size_t num_items = static_cast<size_t>(n) * static_cast<size_t>(n);
+    void* d_temp = nullptr; size_t temp_bytes = 0;
+    cub::DeviceReduce::ArgMin(nullptr, temp_bytes, d_B, d_val, d_idx, num_items);
+    cudaMalloc(&d_temp, temp_bytes);
+
     int steps = 0;
+    int k = n;
+    int l = n;
     while (true) {
-        // Find argmin(B)
-        int totalThreads = n * n;
-        int blockSize = 256;
-        int gridSize = (totalThreads + blockSize - 1) / blockSize;
-        find_argmin<<<gridSize, blockSize>>>(d_B, d_idx, d_val, n);
+        if (k == n){
+            // const size_t num_items = static_cast<size_t>(n) * static_cast<size_t>(n);
+            // void* d_temp = nullptr; size_t temp_bytes = 0;
+            // cub::DeviceReduce::ArgMin(nullptr, temp_bytes, d_B, d_val, d_idx, num_items);
+            // cudaMalloc(&d_temp, temp_bytes);
+            cub::DeviceReduce::ArgMin(d_temp, temp_bytes, d_B, d_val, d_idx, num_items);
+            // cudaFree(d_temp);
 
-        int h_idx;
-        float h_val;
-        cudaMemcpy(&h_idx, d_idx, sizeof(int), cudaMemcpyDeviceToHost);
-        cudaMemcpy(&h_val, d_val, sizeof(float), cudaMemcpyDeviceToHost);
+            // int   h_idx;
+            // cudaMemcpy(&h_idx, d_idx, sizeof(int), cudaMemcpyDeviceToHost);
 
-        int k = h_idx / n;
-        int l = h_idx % n;
+            // int k = h_idx / n;
+            // int l = h_idx % n;
+            // Find argmin(B)
+            // int totalThreads = n * n;
+            // int blockSize = 256;
+            // int gridSize = (totalThreads + blockSize - 1) / blockSize;
+            // find_argmin<<<gridSize, blockSize>>>(d_B, d_idx, d_val, n);
 
-        // std::cout << "Step " << steps << ": argmin at B[" << k << "][" << l << "] = " << h_val << "\n";
+            int h_idx;
+            // float h_val;
+            cudaMemcpy(&h_idx, d_idx, sizeof(int), cudaMemcpyDeviceToHost);
+            // cudaMemcpy(&h_val, d_val, sizeof(float), cudaMemcpyDeviceToHost);
+
+            // k = h_idx / n;
+            // l = h_idx % n;
+            k = h_idx % n;
+            l = h_idx / n;
+        }
+
 
         // Call solve_from_kl, which returns false if we should stop
-        bool should_continue = solve_from_kl(n, d_C, d_X, k, l, d_U, d_V, d_B);
+        bool should_continue = solve_from_kl(n, d_C, d_X, &k, &l, d_U, d_V, d_B);
         steps++;
+        std::cout << "Step " << steps << ": argmin at B[" << k << "][" << l << "] \n";
 
         if (!should_continue) {
             std::cout << "Solver has converged after " << steps << " steps.\n";
@@ -395,6 +395,8 @@ void solve(float* d_C, int* d_X, float* d_U, float* d_V, int n) {
 
     // Cleanup
     cudaFree(d_B);
+    cudaFree(d_temp);
+    // cudaFree(d_out);
     cudaFree(d_idx);
     cudaFree(d_val);
 }
