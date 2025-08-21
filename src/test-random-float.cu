@@ -90,11 +90,11 @@ int main(int argc, char* argv[]) {
     compute_V_from_C_and_X(h_C, h_X, h_V, n);
 
     // Print initialized values
-    print_matrix(h_C, n, "Matrix C");
+    // print_matrix(h_C, n, "Matrix C");
     // print_matrix(reinterpret_cast<float*>(h_X), n, "Mask X");
-    print_matrix(h_X, n, "Mask X");
-    print_vector(h_U, n, "Vector U");
-    print_vector(h_V, n, "Vector V");
+    // print_matrix(h_X, n, "Mask X");
+    // print_vector(h_U, n, "Vector U");
+    // print_vector(h_V, n, "Vector V");
 
     // Device allocations
     float *d_C, *d_U, *d_V;
