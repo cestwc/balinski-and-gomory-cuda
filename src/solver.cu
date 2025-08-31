@@ -164,12 +164,27 @@ __global__ void updateVals(float* B, float* V, int k, int l, int n) {
     V[l] -= epsilon;
 }
 
+__global__ void find_negative(const float* d_B, int n, int* d_found, int* d_i, int* d_j) {
+
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i >= n || i >= n) return;
+
+    float val = d_B[IDX2C(i, j, n)]; // row-major
+    if (val < 0.0f) {
+        *d_found = 1;
+        *d_i = i;
+        *d_j = j;
+    }
+}
+
 
 bool solve_from_kl(
     int n,
     float* d_C, int* d_X, int* d_R,
     int* d_Q, int* d_col_to_row, int* k, int* l, bool* d_changed,
-    float* d_U, float* d_V, float* d_B
+    float* d_U, float* d_V, float* d_B, int* d_found, int* d_i, int* d_j
 ) {
     // Allocate and initialize R and Q
     // int* d_R; int* d_Q;
@@ -238,7 +253,7 @@ bool solve_from_kl(
 
 
         // Recompute B = C - U.unsqueeze(1) - V
-        dim3 threads(16, 16);
+        dim3 threads(256, 256);
         dim3 blocks((n + 15) / 16, (n + 15) / 16);
         compute_B<<<blocks, threads>>>(d_C, d_U, d_V, d_B, n);
 
@@ -298,8 +313,8 @@ bool solve_from_kl(
     update_duals<<<(n + 255) / 256, 256>>>(d_R, d_Q, d_U, d_V, epsilon, n);
 
     // Recompute B
-    dim3 threads(16, 16);
-    dim3 blocks((n + 15) / 16, (n + 15) / 16);
+    dim3 threads(256, 256);
+    dim3 blocks((n + 255) / 256, (n + 255) / 256);
     compute_B<<<blocks, threads>>>(d_C, d_U, d_V, d_B, n);
     cudaDeviceSynchronize();
 
@@ -314,25 +329,42 @@ bool solve_from_kl(
     }
 
     // Check if any B[i,j] < 0
-    bool any_negative = false;
-    for (int i = 0; i < n && !any_negative; ++i) {
-        for (int j = 0; j < n; ++j) {
-            float b_ij;
-            cudaMemcpy(&b_ij, &d_B[IDX2C(i, j, n)], sizeof(float), cudaMemcpyDeviceToHost);
-            if (b_ij < 0) {
-                any_negative = true;
-                // cudaFree(d_R);
-                // cudaFree(d_Q);
-                *k = i;
-                *l = j;
-                return true;
-            }
-        }
+    // bool any_negative = false;
+    // for (int i = 0; i < n && !any_negative; ++i) {
+    //     for (int j = 0; j < n; ++j) {
+    //         float b_ij;
+    //         cudaMemcpy(&b_ij, &d_B[IDX2C(i, j, n)], sizeof(float), cudaMemcpyDeviceToHost);
+    //         if (b_ij < 0) {
+    //             any_negative = true;
+    //             // cudaFree(d_R);
+    //             // cudaFree(d_Q);
+    //             *k = i;
+    //             *l = j;
+    //             return true;
+    //         }
+    //     }
+    // }
+    int h_found;
+
+    cudaMemset(d_found, 0, sizeof(int));
+    find_negative<<<blocks, threads>>>(d_B, n, d_found, d_i, d_j);
+    cudaMemcpy(&h_found, d_found, sizeof(int), cudaMemcpyDeviceToHost);
+
+    if (h_found) {
+        int row, col;
+        cudaMemcpy(&row, d_i, sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&col, d_j, sizeof(int), cudaMemcpyDeviceToHost);
+        *k = row;
+        *l = col;
+        return true;
+    } else {
+        return false;
     }
+
 
     // cudaFree(d_R);
     // cudaFree(d_Q);
-    return false;
+    // return false;
 }
 
 // using KVP = cub::KeyValuePair<int, float>;
@@ -354,8 +386,17 @@ void solve(float* d_C, int* d_X, float* d_U, float* d_V, int n) {
     cudaMalloc(&d_idx, sizeof(int));
     cudaMalloc(&d_val, sizeof(float));
 
+    int *d_found, *d_i, *d_j;
+    cudaMalloc(&d_found, sizeof(int));
+    cudaMalloc(&d_i, sizeof(int));
+    cudaMalloc(&d_j, sizeof(int));
+
+    // cudaMemcpy(d_found, &h_found, sizeof(int), cudaMemcpyHostToDevice);
+    
+
+
     // Compute initial B
-    dim3 threads(16, 16);
+    dim3 threads(256, 256);
     dim3 blocks((n + 15) / 16, (n + 15) / 16);
     compute_B<<<blocks, threads>>>(d_C, d_U, d_V, d_B, n);
 
@@ -410,7 +451,7 @@ void solve(float* d_C, int* d_X, float* d_U, float* d_V, int n) {
 
 
         // Call solve_from_kl, which returns false if we should stop
-        bool should_continue = solve_from_kl(n, d_C, d_X, d_R, d_Q, d_col_to_row, &k, &l, d_changed, d_U, d_V, d_B);
+        bool should_continue = solve_from_kl(n, d_C, d_X, d_R, d_Q, d_col_to_row, &k, &l, d_changed, d_U, d_V, d_B, d_found, d_i, d_j);
         steps++;
         // std::cout << "Step " << steps << ": argmin at B[" << k << "][" << l << "] \n";
 
@@ -431,6 +472,10 @@ void solve(float* d_C, int* d_X, float* d_U, float* d_V, int n) {
     cudaFree(d_Q);
     cudaFree(d_col_to_row);
     cudaFree(d_changed);
+
+    cudaFree(d_found);
+    cudaFree(d_i);
+    cudaFree(d_j);
 }
 
 
@@ -468,7 +513,7 @@ void verify_solution(float* d_C, int* d_X, float* d_U, float* d_V, int n) {
     cudaMemset(d_feasible, 0, sizeof(int));
     cudaMemset(d_slack, 0, sizeof(int));
 
-    dim3 threads(16, 16);
+    dim3 threads(256, 256);
     dim3 blocks((n + 15) / 16, (n + 15) / 16);
 
     check_feasible_condition<<<blocks, threads>>>(d_C, d_X, d_U, d_V, d_feasible, n);
