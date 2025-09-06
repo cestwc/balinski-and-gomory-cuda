@@ -84,13 +84,32 @@ int main(int argc, char* argv[]) {
     // Fill values
     srand(static_cast<unsigned>(time(0)));
     fill_random(h_C, n);
+    // float vals[4][4] = {
+    //     {2, 3, 1, 1},
+    //     {5, 8, 3, 2},
+    //     {4, 9, 5, 1},
+    //     {8, 7, 8, 4}
+    // };
+
+    // for (int i = 0; i < n; i++) {
+    //     for (int j = 0; j < n; j++) {
+    //         h_C[i * n + j] = vals[i][j];  // row-major
+    //     }
+    // }
+
+    // for (int i = 0; i < n; i++) {
+    //     for (int j = 0; j < n; j++) {
+    //         // h_C[i + j * n] = vals[i][j];  // column-major
+    //         h_C[IDX2C(i,j,n)] = vals[i][j];
+    //     }
+    // }
     initialize_identity_mask(h_X, n);
 
     for (int i = 0; i < n; ++i) h_U[i] = 0; // U = 0
     compute_V_from_C_and_X(h_C, h_X, h_V, n);
 
     // Print initialized values
-    // print_matrix(h_C, n, "Matrix C");
+    print_matrix(h_C, n, "Matrix C");
     // print_matrix(reinterpret_cast<float*>(h_X), n, "Mask X");
     // print_matrix(h_X, n, "Mask X");
     // print_vector(h_U, n, "Vector U");
@@ -144,7 +163,7 @@ int main(int argc, char* argv[]) {
 
     cudaMemcpy(h_X, d_X, maskSize, cudaMemcpyDeviceToHost);
     // print_matrix(reinterpret_cast<float*>(h_X), n, "Mask X");
-    // print_matrix(h_X, n, "Mask X");
+    print_matrix(h_X, n, "Mask X");
     // print_vector(h_U, n, "Vector U");
     // print_vector(h_V, n, "Vector V");
 
