@@ -120,18 +120,18 @@ __global__ void solve_1bc_kernel(
 
 // }
 
-__device__ int d_outstanding;
 __device__ int d_progress;
+__device__ int d_finish;
 __device__ int d_stop_flag;
 __device__ int d_moving;
-__device__ int done;
+__device__ int d_outstanding;
 
 __global__ void reset_globals() {
-    d_outstanding = 0;
-    d_progress    = 0;
+    d_progress = 0;
+    d_finish    = 0;
     d_stop_flag   = 0;
-    d_moving = 1;
-    done = 0;
+    d_moving = 0;
+    d_outstanding = 0;
 }
 
 __global__ void reset_done(
@@ -143,9 +143,24 @@ __global__ void reset_done(
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n && j < n){
         if (B[IDX2C(i, j, n)] != 0.0f ) {
-            atomicAdd(&done, 1);
+            atomicAdd(&d_finish, 1);
+            atomicAdd(&d_progress, 1);
         }
     }    
+}
+
+
+__global__ void print_RQ(
+    int n,
+    int* R,
+    int* Q
+){
+    for (int w = 0; w < n; w++) {
+            printf("R[%d] = %d\n", w, R[w]);
+        }
+        for (int w = 0; w < n; w++) {
+            printf("Q[%d] = %d\n", w, Q[w]);
+        }
 }
 
 __global__ void solve_1bc_kernel_full(
@@ -161,59 +176,55 @@ __global__ void solve_1bc_kernel_full(
     if (i >= n || j >= n) return;
     if (B[IDX2C(i, j, n)] != 0.0f) return;
 
-
     int contributing = 1;
-    int step = 0;
     int local_move = 0;
-    int doing = 0;
-    int iteration;
-    int accumulate;
-    int expected = n * n - done;
-    int old_p;
-    int lastout;
+    int doing ;
 
     do {
-        
-        
-        if (Q[j] != n && i == col_to_row[j] && R[i] == n) {
-            R[i] = j;
-            doing = 1;
-        } else if (i != k && R[i] != n && Q[j] == n) {
-            Q[j] = i;
-            doing = 1;
-        } else {
-            doing = 0;
-        }
-        
-
-
-        old_p = atomicAdd(&d_progress, contributing);
-        if (contributing == 1 && doing == 0){
-            atomicAdd(&d_outstanding, 1);
-        }
-        __threadfence();
-
-        iteration = (old_p + contributing) / (expected);
-        accumulate = (old_p + contributing) % (expected);
-
-        if (iteration > step && d_moving > local_move){
-            contributing = 1;
-            step++;
-            local_move++;
-            if (accumulate == 0){
-                lastout = atomicExch(&d_outstanding, 0);
-                __threadfence();
-                if (lastout == expected){
-                    atomicAdd(&d_stop_flag, 1);
-                }
-                atomicAdd(&d_moving, 1);
+        if (contributing == 1){
+            
+       
+            if (Q[j] != n && i == col_to_row[j] && R[i] == n) {
+                R[i] = j;
+                // atomicExch(&R[i], j);
+                doing = 1;
+            } else if (i != k && R[i] != n && Q[j] == n) {
+                Q[j] = i;
+                // atomicExch(&Q[j], i);
+                doing = 1;
+            } else {
+                doing = 0;
             }
+
+            atomicAdd(&d_finish, doing);
+            atomicAdd(&d_outstanding, doing);
+            
+
+            if ((atomicAdd(&d_progress, 1) + 1) == n * n){
+                // atomicExch(&d_progress, d_finish);
+                d_progress = d_finish;
+
+                if (atomicExch(&d_outstanding, 0) == 0) {
+                    // atomicCAS(&d_stop_flag, 0, 1);
+                    d_stop_flag = 1;
+                    return;
+                } else {
+                    // atomicAdd(&d_moving, 1);
+                    d_moving++;
+                }
+            }
+            if (doing == 1) {return;}
+
+        } 
+
+        __threadfence();
+        if (d_moving > local_move){
+            contributing = 1;
+            local_move++;
         } else {
             contributing = 0;
         }
 
-
-        
 
     } while (d_stop_flag == 0);
 
@@ -318,6 +329,7 @@ bool solve_from_kl(
 
     reset_globals<<<1,1>>>();
     reset_done<<<blocks, threads>>>(n, *k, d_B);
+    // print_RQ<<<1,1>>>(n, d_R, d_Q);
 
     solve_1bc_kernel_full<<<blocks, threads>>>(n, d_col_to_row, *k, d_B, d_R, d_Q);
     // void* args[] = { &n, &d_col_to_row, &k, &d_B, &d_R, &d_Q };
@@ -520,7 +532,7 @@ void solve(float* d_C, int* d_X, float* d_U, float* d_V, int n) {
             l = h_idx / n;
         }
 
-        // std::cout << "Step " << steps << ": argmin at B[" << k << "][" << l << "] \n";
+        std::cout << "Step " << steps << ": argmin at B[" << k << "][" << l << "] \n";
 
         // Call solve_from_kl, which returns false if we should stop
         bool should_continue = solve_from_kl(n, d_C, d_X, d_R, d_Q, d_col_to_row, &k, &l, d_changed, d_waiting, d_U, d_V, d_B, d_found, d_i, d_j, d_min);

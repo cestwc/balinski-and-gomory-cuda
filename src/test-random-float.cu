@@ -163,7 +163,7 @@ int main(int argc, char* argv[]) {
 
     cudaMemcpy(h_X, d_X, maskSize, cudaMemcpyDeviceToHost);
     // print_matrix(reinterpret_cast<float*>(h_X), n, "Mask X");
-    print_matrix(h_X, n, "Mask X");
+    if (n < 10) print_matrix(h_X, n, "Mask X");
     // print_vector(h_U, n, "Vector U");
     // print_vector(h_V, n, "Vector V");
 
