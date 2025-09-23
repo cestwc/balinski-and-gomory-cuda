@@ -120,115 +120,115 @@ __global__ void solve_1bc_kernel(
 
 // }
 
-__device__ int d_progress;
-__device__ int d_finish;
-__device__ int d_stop_flag;
-__device__ int d_moving;
-__device__ int d_outstanding;
+// __device__ int d_progress;
+// __device__ int d_finish;
+// __device__ int d_stop_flag;
+// __device__ int d_moving;
+// __device__ int d_outstanding;
 
-__global__ void reset_globals() {
-    d_progress = 0;
-    d_finish    = 0;
-    d_stop_flag   = 0;
-    d_moving = 0;
-    d_outstanding = 0;
-}
+// __global__ void reset_globals() {
+//     d_progress = 0;
+//     d_finish    = 0;
+//     d_stop_flag   = 0;
+//     d_moving = 0;
+//     d_outstanding = 0;
+// }
 
-__global__ void reset_done(
-    int n,
-    int k,
-    const float* B
-) {
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n && j < n){
-        if (B[IDX2C(i, j, n)] != 0.0f ) {
-            atomicAdd(&d_finish, 1);
-            atomicAdd(&d_progress, 1);
-        }
-    }    
-}
+// __global__ void reset_done(
+//     int n,
+//     int k,
+//     const float* B
+// ) {
+//     int i = blockIdx.y * blockDim.y + threadIdx.y;
+//     int j = blockIdx.x * blockDim.x + threadIdx.x;
+//     if (i < n && j < n){
+//         if (B[IDX2C(i, j, n)] != 0.0f ) {
+//             atomicAdd(&d_finish, 1);
+//             atomicAdd(&d_progress, 1);
+//         }
+//     }    
+// }
 
 
-__global__ void print_RQ(
-    int n,
-    int* R,
-    int* Q
-){
-    for (int w = 0; w < n; w++) {
-            printf("R[%d] = %d\n", w, R[w]);
-        }
-        for (int w = 0; w < n; w++) {
-            printf("Q[%d] = %d\n", w, Q[w]);
-        }
-}
+// __global__ void print_RQ(
+//     int n,
+//     int* R,
+//     int* Q
+// ){
+//     for (int w = 0; w < n; w++) {
+//             printf("R[%d] = %d\n", w, R[w]);
+//         }
+//         for (int w = 0; w < n; w++) {
+//             printf("Q[%d] = %d\n", w, Q[w]);
+//         }
+// }
 
-__global__ void solve_1bc_kernel_full(
-    int n,
-    const int* col_to_row,
-    int k,
-    const float* B,
-    int* R,
-    int* Q
-) {
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n || j >= n) return;
-    if (B[IDX2C(i, j, n)] != 0.0f) return;
+// __global__ void solve_1bc_kernel_full(
+//     int n,
+//     const int* col_to_row,
+//     int k,
+//     const float* B,
+//     int* R,
+//     int* Q
+// ) {
+//     int i = blockIdx.y * blockDim.y + threadIdx.y;
+//     int j = blockIdx.x * blockDim.x + threadIdx.x;
+//     if (i >= n || j >= n) return;
+//     if (B[IDX2C(i, j, n)] != 0.0f) return;
 
-    int contributing = 1;
-    int local_move = 0;
-    int doing ;
+//     int contributing = 1;
+//     int local_move = 0;
+//     int doing ;
 
-    do {
-        if (contributing == 1){
+//     do {
+//         if (contributing == 1){
             
        
-            if (Q[j] != n && i == col_to_row[j] && R[i] == n) {
-                R[i] = j;
-                // atomicExch(&R[i], j);
-                doing = 1;
-            } else if (i != k && R[i] != n && Q[j] == n) {
-                Q[j] = i;
-                // atomicExch(&Q[j], i);
-                doing = 1;
-            } else {
-                doing = 0;
-            }
+//             if (Q[j] != n && i == col_to_row[j] && R[i] == n) {
+//                 R[i] = j;
+//                 // atomicExch(&R[i], j);
+//                 doing = 1;
+//             } else if (i != k && R[i] != n && Q[j] == n) {
+//                 Q[j] = i;
+//                 // atomicExch(&Q[j], i);
+//                 doing = 1;
+//             } else {
+//                 doing = 0;
+//             }
 
-            atomicAdd(&d_finish, doing);
-            atomicAdd(&d_outstanding, doing);
+//             atomicAdd(&d_finish, doing);
+//             atomicAdd(&d_outstanding, doing);
             
 
-            if ((atomicAdd(&d_progress, 1) + 1) == n * n){
-                // atomicExch(&d_progress, d_finish);
-                d_progress = d_finish;
+//             if ((atomicAdd(&d_progress, 1) + 1) == n * n){
+//                 // atomicExch(&d_progress, d_finish);
+//                 d_progress = d_finish;
 
-                if (atomicExch(&d_outstanding, 0) == 0) {
-                    // atomicCAS(&d_stop_flag, 0, 1);
-                    d_stop_flag = 1;
-                    return;
-                } else {
-                    // atomicAdd(&d_moving, 1);
-                    d_moving++;
-                }
-            }
-            if (doing == 1) {return;}
+//                 if (atomicExch(&d_outstanding, 0) == 0) {
+//                     // atomicCAS(&d_stop_flag, 0, 1);
+//                     d_stop_flag = 1;
+//                     return;
+//                 } else {
+//                     // atomicAdd(&d_moving, 1);
+//                     d_moving++;
+//                 }
+//             }
+//             if (doing == 1) {return;}
 
-        } 
+//         } 
 
-        __threadfence();
-        if (d_moving > local_move){
-            contributing = 1;
-            local_move++;
-        } else {
-            contributing = 0;
-        }
+//         __threadfence();
+//         if (d_moving > local_move){
+//             contributing = 1;
+//             local_move++;
+//         } else {
+//             contributing = 0;
+//         }
 
 
-    } while (d_stop_flag == 0);
+//     } while (d_stop_flag == 0);
 
-}
+// }
 
 
 
@@ -305,12 +305,11 @@ __global__ void find_min_valid_atomic2d(const float* d_B,
 bool solve_from_kl(
     int n,
     float* d_C, int* d_X, int* d_R,
-    int* d_Q, int* d_col_to_row, int* k, int* l, int* d_changed, int* d_waiting,
+    int* d_Q, int* d_col_to_row, int* k, int* l, bool* d_changed, int* d_waiting,
     float* d_U, float* d_V, float* d_B, int* d_found, int* d_i, int* d_j, float* d_min
 ) {
 
-    set_array_value<<<(n + 255)/256, 256>>>(d_R, n, n);
-    set_array_value<<<(n + 255)/256, 256>>>(d_Q, n, n);
+    
 
     // Q[*l] = *k
     cudaMemcpy(&d_Q[*l], k, sizeof(int), cudaMemcpyHostToDevice);
@@ -323,15 +322,33 @@ bool solve_from_kl(
     compute_col_to_row<<<blocks, threads>>>(n, d_X, d_col_to_row);
     cudaDeviceSynchronize();
 
+    // dim3 threads(16, 16);
+    // dim3 blocks((n + 15) / 16, (n + 15) / 16);
+
+    bool h_changed;
+
+    do {
+        h_changed = false;
+        cudaMemcpy(d_changed, &h_changed, sizeof(bool), cudaMemcpyHostToDevice);
+
+        // NOTE: kernel takes k by value — pass *k
+        solve_1bc_kernel<<<blocks, threads>>>(
+            n, d_col_to_row, *k, d_B, d_R, d_Q, d_changed
+        );
+
+        cudaMemcpy(&h_changed, d_changed, sizeof(bool), cudaMemcpyDeviceToHost);
+        cudaDeviceSynchronize();
+    } while (h_changed);
+
     // for (int s = 0; s < n; ++s) {
     // solve_1bc(n, d_col_to_row, k, l, d_changed, d_B, d_R, d_Q);
     // cudaMemset(row_done, 0, n * sizeof(int));
 
-    reset_globals<<<1,1>>>();
-    reset_done<<<blocks, threads>>>(n, *k, d_B);
+    // reset_globals<<<1,1>>>();
+    // reset_done<<<blocks, threads>>>(n, *k, d_B);
     // print_RQ<<<1,1>>>(n, d_R, d_Q);
 
-    solve_1bc_kernel_full<<<blocks, threads>>>(n, d_col_to_row, *k, d_B, d_R, d_Q);
+    // solve_1bc_kernel_full<<<blocks, threads>>>(n, d_col_to_row, *k, d_B, d_R, d_Q);
     // void* args[] = { &n, &d_col_to_row, &k, &d_B, &d_R, &d_Q };
     // cudaLaunchCooperativeKernel(
     //     (void*)solve_1bc_kernel_full,
@@ -400,6 +417,8 @@ bool solve_from_kl(
 
         *k = n;
         *l = n;
+        set_array_value<<<(n + 255)/256, 256>>>(d_R, n, n);
+        set_array_value<<<(n + 255)/256, 256>>>(d_Q, n, n);
 
         return true;
     }
@@ -454,6 +473,8 @@ bool solve_from_kl(
         cudaMemcpy(&col, d_j, sizeof(int), cudaMemcpyDeviceToHost);
         *k = row;
         *l = col;
+        set_array_value<<<(n + 255)/256, 256>>>(d_R, n, n);
+        set_array_value<<<(n + 255)/256, 256>>>(d_Q, n, n);
         return true;
     } else {
         return false;
@@ -503,10 +524,13 @@ void solve(float* d_C, int* d_X, float* d_U, float* d_V, int n) {
     cudaMalloc(&d_R, n * sizeof(int));
     cudaMalloc(&d_Q, n * sizeof(int));
 
+    set_array_value<<<(n + 255)/256, 256>>>(d_R, n, n);
+    set_array_value<<<(n + 255)/256, 256>>>(d_Q, n, n);
+
     int* d_col_to_row;
     cudaMalloc(&d_col_to_row, n * sizeof(int));
 
-    int* d_changed;
+    bool* d_changed;
     cudaMalloc(&d_changed, sizeof(int));
 
     int* d_waiting;

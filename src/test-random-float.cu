@@ -84,25 +84,29 @@ int main(int argc, char* argv[]) {
     // Fill values
     srand(static_cast<unsigned>(time(0)));
     fill_random(h_C, n);
-    // float vals[4][4] = {
-    //     {2, 3, 1, 1},
-    //     {5, 8, 3, 2},
-    //     {4, 9, 5, 1},
-    //     {8, 7, 8, 4}
-    // };
 
-    // for (int i = 0; i < n; i++) {
-    //     for (int j = 0; j < n; j++) {
-    //         h_C[i * n + j] = vals[i][j];  // row-major
-    //     }
-    // }
+    if (n == 4){
+        float vals[4][4] = {
+            {2, 3, 1, 1},
+            {5, 8, 3, 2},
+            {4, 9, 5, 1},
+            {8, 7, 8, 4}
+        };
 
-    // for (int i = 0; i < n; i++) {
-    //     for (int j = 0; j < n; j++) {
-    //         // h_C[i + j * n] = vals[i][j];  // column-major
-    //         h_C[IDX2C(i,j,n)] = vals[i][j];
-    //     }
-    // }
+        // for (int i = 0; i < n; i++) {
+        //     for (int j = 0; j < n; j++) {
+        //         h_C[i * n + j] = vals[i][j];  // row-major
+        //     }
+        // }
+
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < n; j++) {
+                // h_C[i + j * n] = vals[i][j];  // column-major
+                h_C[IDX2C(i,j,n)] = vals[i][j];
+            }
+        }
+    }
+    
     initialize_identity_mask(h_X, n);
 
     for (int i = 0; i < n; ++i) h_U[i] = 0; // U = 0
