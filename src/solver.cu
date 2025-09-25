@@ -6,8 +6,6 @@
 #define IDX2C(i,j,n) ((j)*(n)+(i))
 #include <math_constants.h>   // for CUDART_INF_F
 
-// #define IDX2C(i,j,n) ((i)*(n)+(j))
-
 __global__ void compute_B(const float* C, const float* U, const float* V, float* B, int n) {
     int i = blockIdx.y * blockDim.y + threadIdx.y;
     int j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -45,22 +43,12 @@ __global__ void find_argmin(const float* B, int* out_idx, float* out_val, int n)
     }
 }
 
-__global__ void compute_col_to_row(int n, const int* X, int* col_to_row) {
-    int i = blockIdx.y * blockDim.y + threadIdx.y;
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (i >= n || j >= n) return;
-
-    if (X[IDX2C(i, j, n)] == 1) {
-        col_to_row[j] = i;
-    }
-}
-
-
 __global__ void solve_1bc_kernel(
     int n,
-    const int* col_to_row,
+    // const int* col_to_row,
+    const int* X,
     int k,
+    int l,
     const float* B,
     int* R,
     int* Q,
@@ -71,13 +59,12 @@ __global__ void solve_1bc_kernel(
 
     if (i >= n || j >= n) return;
 
-    // Step (b): still only run one thread per column
-    if (i == 0 && Q[j] != n) {
-        int row = col_to_row[j];
-        if (R[row] == n) {
-            R[row] = j;
+    if (Q[j] != n && X[IDX2C(i, j, n)] == 1){
+
+        if (atomicCAS(&R[i], n, j) == n) {
             *changed = true;
         }
+
     }
 
     // Step (c): one thread per (i, j)
@@ -92,148 +79,6 @@ __global__ void solve_1bc_kernel(
 }
 
 
-// void solve_1bc(
-//     int n,
-//     int* d_col_to_row,
-//     int* k,            // now pointer
-//     int* l,            // now pointer (not used here, but kept for symmetry)
-//     bool* d_changed,
-//     float* d_B,
-//     int* d_R,
-//     int* d_Q
-// ){
-//     dim3 threads(16, 16);
-//     dim3 blocks((n + 15) / 16, (n + 15) / 16);
-
-//     bool h_changed;
-
-//     do {
-//         h_changed = false;
-//         cudaMemcpy(d_changed, &h_changed, sizeof(bool), cudaMemcpyHostToDevice);
-
-//         // NOTE: kernel takes k by value — pass *k
-//         solve_1bc_kernel<<<blocks, threads>>>(
-//             n, d_col_to_row, *k, d_B, d_R, d_Q, d_changed
-//         );
-
-//         cudaMemcpy(&h_changed, d_changed, sizeof(bool), cudaMemcpyDeviceToHost);
-//         cudaDeviceSynchronize();
-//     } while (h_changed);
-
-// }
-
-// __device__ int d_progress;
-// __device__ int d_finish;
-// __device__ int d_stop_flag;
-// __device__ int d_moving;
-// __device__ int d_outstanding;
-
-// __global__ void reset_globals() {
-//     d_progress = 0;
-//     d_finish    = 0;
-//     d_stop_flag   = 0;
-//     d_moving = 0;
-//     d_outstanding = 0;
-// }
-
-// __global__ void reset_done(
-//     int n,
-//     int k,
-//     const float* B
-// ) {
-//     int i = blockIdx.y * blockDim.y + threadIdx.y;
-//     int j = blockIdx.x * blockDim.x + threadIdx.x;
-//     if (i < n && j < n){
-//         if (B[IDX2C(i, j, n)] != 0.0f ) {
-//             atomicAdd(&d_finish, 1);
-//             atomicAdd(&d_progress, 1);
-//         }
-//     }    
-// }
-
-
-// __global__ void print_RQ(
-//     int n,
-//     int* R,
-//     int* Q
-// ){
-//     for (int w = 0; w < n; w++) {
-//             printf("R[%d] = %d\n", w, R[w]);
-//         }
-//         for (int w = 0; w < n; w++) {
-//             printf("Q[%d] = %d\n", w, Q[w]);
-//         }
-// }
-
-// __global__ void solve_1bc_kernel_full(
-//     int n,
-//     const int* col_to_row,
-//     int k,
-//     const float* B,
-//     int* R,
-//     int* Q
-// ) {
-//     int i = blockIdx.y * blockDim.y + threadIdx.y;
-//     int j = blockIdx.x * blockDim.x + threadIdx.x;
-//     if (i >= n || j >= n) return;
-//     if (B[IDX2C(i, j, n)] != 0.0f) return;
-
-//     int contributing = 1;
-//     int local_move = 0;
-//     int doing ;
-
-//     do {
-//         if (contributing == 1){
-            
-       
-//             if (Q[j] != n && i == col_to_row[j] && R[i] == n) {
-//                 R[i] = j;
-//                 // atomicExch(&R[i], j);
-//                 doing = 1;
-//             } else if (i != k && R[i] != n && Q[j] == n) {
-//                 Q[j] = i;
-//                 // atomicExch(&Q[j], i);
-//                 doing = 1;
-//             } else {
-//                 doing = 0;
-//             }
-
-//             atomicAdd(&d_finish, doing);
-//             atomicAdd(&d_outstanding, doing);
-            
-
-//             if ((atomicAdd(&d_progress, 1) + 1) == n * n){
-//                 // atomicExch(&d_progress, d_finish);
-//                 d_progress = d_finish;
-
-//                 if (atomicExch(&d_outstanding, 0) == 0) {
-//                     // atomicCAS(&d_stop_flag, 0, 1);
-//                     d_stop_flag = 1;
-//                     return;
-//                 } else {
-//                     // atomicAdd(&d_moving, 1);
-//                     d_moving++;
-//                 }
-//             }
-//             if (doing == 1) {return;}
-
-//         } 
-
-//         __threadfence();
-//         if (d_moving > local_move){
-//             contributing = 1;
-//             local_move++;
-//         } else {
-//             contributing = 0;
-//         }
-
-
-//     } while (d_stop_flag == 0);
-
-// }
-
-
-
 
 
 __global__ void set_array_value(int* arr, int value, int n) {
@@ -241,21 +86,14 @@ __global__ void set_array_value(int* arr, int value, int n) {
     if (idx < n) arr[idx] = value;
 }
 
-__global__ void update_duals(int* R, int* Q, float* U, float* V, float epsilon, int n) {
+__global__ void update_duals(int* R, int* Q, float* U, float* V, float* epsilon, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        if (R[i] != n) U[i] += epsilon;
-        if (Q[i] != n) V[i] -= epsilon;
+        if (R[i] != n) U[i] += *epsilon;
+        if (Q[i] != n) V[i] -= *epsilon;
     }
 }
 
-__global__ void updateVals(float* B, float* V, int k, int l, int n) {
-    int idx = IDX2C(k, l, n);   // compute column-major offset
-    float b_kl = B[idx];
-    float epsilon = -b_kl;
-
-    V[l] -= epsilon;
-}
 
 __global__ void find_negative(const float* d_B, int n, int* d_found, int* d_i, int* d_j) {
 
@@ -274,40 +112,17 @@ __global__ void find_negative(const float* d_B, int n, int* d_found, int* d_i, i
     }
 }
 
-// __device__ float atomicMinFloat(float* addr, float value) {
-//     int* addr_as_i = (int*)addr;
-//     int old = *addr_as_i, assumed;
-
-//     while (value < __int_as_float(old)) {
-//         assumed = old;
-//         old = atomicCAS(addr_as_i, assumed, __float_as_int(value));
-//     }
-//     return __int_as_float(old);
-// }
-
-// __global__ void find_min_valid_atomic2d(const float* d_B,
-//                                         const int* d_R,
-//                                         const int* d_Q,
-//                                         int n,
-//                                         float* d_minval) {
-//     int row = blockIdx.y * blockDim.y + threadIdx.y;
-//     int col = blockIdx.x * blockDim.x + threadIdx.x;
-
-//     if (row >= n || col >= n) return;
-
-//     if (d_R[row] != n && d_Q[col] == n) {
-//         float val = d_B[IDX2C(row, col, n)]; // row-major
-//         if (val >= 0.0f) {
-//             atomicMinFloat(d_minval, val);
-//         }
-//     }
-// }
-
 // Use integer atomicMin for non-negative floats
 __device__ inline void atomicMinFloatNonNeg(float* addr, float val) {
     // Reinterpret as unsigned to preserve ordering for non-negative floats
     atomicMin(reinterpret_cast<unsigned int*>(addr), __float_as_uint(val));
 }
+
+__global__ void init_minval(float* d_minval) {
+    // if (threadIdx.x == 0 && blockIdx.x == 0)
+    *d_minval = CUDART_INF_F;
+}
+
 
 __global__ void find_min_valid_atomic2d(const float* __restrict__ d_B,
                                       const int*   __restrict__ d_R,
@@ -358,14 +173,14 @@ __global__ void find_min_valid_atomic2d(const float* __restrict__ d_B,
     }
 }
 
-__global__ void process_cycle(int* d_X,
+__global__ void process_cycle(float* B, float* V, int* d_X,
                               const int* d_R,
                               const int* d_Q,
                               int n,
-                              int k0, int l0)
+                              int k, int l)
 {
-    int k_ = k0;
-    int l_ = l0;
+    int k_ = k;
+    int l_ = l;
 
     while (true) {
         // X[k_, l_] = 1
@@ -381,16 +196,32 @@ __global__ void process_cycle(int* d_X,
         k_ = d_Q[l_];
 
         // stop if cycle closed
-        if (k_ == k0 && l_ == l0)
+        if (k_ == k && l_ == l)
             break;
     }
+
+    V[l] += B[IDX2C(k, l, n)];
 }
+
+__global__ void finalize_epsilon(const float* d_min,
+                                 const float* d_B,
+                                 int n,
+                                 int k, int l,
+                                 float* d_epsilon)
+{
+    if (isinf(*d_min)) {
+        *d_epsilon = -d_B[IDX2C(k, l, n)];
+    } else {
+        *d_epsilon = *d_min;
+    }
+}
+
 
 
 bool solve_from_kl(
     int n,
     float* d_C, int* d_X, int* d_R,
-    int* d_Q, int* d_col_to_row, int* k, int* l, bool* d_changed, int* d_waiting,
+    int* d_Q, int* d_col_to_row, int* k, int* l, bool* d_changed, int* d_waiting, float* d_epsilon,
     float* d_U, float* d_V, float* d_B, int* d_found, int* d_i, int* d_j, float* d_min
 ) {
 
@@ -404,7 +235,7 @@ bool solve_from_kl(
     dim3 blocks((n + threads.x - 1) / threads.x,
                 (n + threads.y - 1) / threads.y);
 
-    compute_col_to_row<<<blocks, threads>>>(n, d_X, d_col_to_row);
+    // compute_col_to_row<<<blocks, threads>>>(n, d_X, d_col_to_row);
     cudaDeviceSynchronize();
 
     // dim3 threads(16, 16);
@@ -418,7 +249,7 @@ bool solve_from_kl(
 
         // NOTE: kernel takes k by value — pass *k
         solve_1bc_kernel<<<blocks, threads>>>(
-            n, d_col_to_row, *k, d_B, d_R, d_Q, d_changed
+            n, d_X, *k, *l, d_B, d_R, d_Q, d_changed
         );
 
         cudaMemcpy(&h_changed, d_changed, sizeof(bool), cudaMemcpyDeviceToHost);
@@ -431,81 +262,31 @@ bool solve_from_kl(
 
     if (h_Rk != n && h_Rk != *l) {
         // say k and l are already defined on host
-        process_cycle<<<1,1>>>(d_X, d_R, d_Q, n, *k, *l);
+        process_cycle<<<1,1>>>(d_B, d_V, d_X, d_R, d_Q, n, *k, *l);
 
         // sync *once* if you need results on host right away
         cudaDeviceSynchronize();
-
-        // int k_ = *k;
-        // int l_ = *l;
-
-        // int h_R, h_Q;
-
-        // while (true) {
-        //     // X[k_, l_] = 1
-        //     int one = 1;
-        //     int idx_on = IDX2C(k_, l_, n);
-        //     cudaMemcpy(&d_X[idx_on], &one, sizeof(int), cudaMemcpyHostToDevice);
-
-        //     // l_ = R[k_]
-        //     cudaMemcpy(&h_R, &d_R[k_], sizeof(int), cudaMemcpyDeviceToHost);
-        //     l_ = h_R;
-
-        //     // X[k_, l_] = 0
-        //     int zero = 0;
-        //     int idx_off = IDX2C(k_, l_, n);
-        //     cudaMemcpy(&d_X[idx_off], &zero, sizeof(int), cudaMemcpyHostToDevice);
-
-        //     // k_ = Q[l_]
-        //     cudaMemcpy(&h_Q, &d_Q[l_], sizeof(int), cudaMemcpyDeviceToHost);
-        //     k_ = h_Q;
-
-        //     if (k_ == *k && l_ == *l)
-        //         break;
-        // }
-
-        updateVals<<<1,1>>>(d_B, d_V, *k, *l, n);
-
-
-        // Recompute B = C - U.unsqueeze(1) - V
-        // dim3 threads(16, 16);
-        // dim3 blocks((n + 15) / 16, (n + 15) / 16);
-        compute_B<<<blocks, threads>>>(d_C, d_U, d_V, d_B, n);
 
         *k = n;
         *l = n;
         set_array_value<<<(n + 255)/256, 256>>>(d_R, n, n);
         set_array_value<<<(n + 255)/256, 256>>>(d_Q, n, n);
 
+        compute_B<<<blocks, threads>>>(d_C, d_U, d_V, d_B, n);
+
         return true;
     }
 
-    float h_min = INFINITY;
+    init_minval<<<1, 1>>>(d_min);
     
-    cudaMemcpy(d_min, &h_min, sizeof(float), cudaMemcpyHostToDevice);
-
-    // configure launch
-    // dim3 threads(16, 16);
-    // dim3 blocks((n + 15) / 16, (n + 15) / 16);
-
     find_min_valid_atomic2d<<<blocks, threads>>>(d_B, d_R, d_Q, n, d_min);
 
-    cudaMemcpy(&h_min, d_min, sizeof(float), cudaMemcpyDeviceToHost);
-    
-
-    // finalize epsilon
-    float epsilon;
-    if (h_min == INFINITY) {
-        float b_kl;
-        cudaMemcpy(&b_kl, &d_B[IDX2C(*k, *l, n)], sizeof(float), cudaMemcpyDeviceToHost);
-        epsilon = -b_kl;
-    } else {
-        epsilon = h_min;
-    }
+    finalize_epsilon<<<1, 1>>>(d_min, d_B, n, *k, *l, d_epsilon);
 
 
 
-    update_duals<<<(n + 255) / 256, 256>>>(d_R, d_Q, d_U, d_V, epsilon, n);
+
+    update_duals<<<(n + 255) / 256, 256>>>(d_R, d_Q, d_U, d_V, d_epsilon, n);
     compute_B<<<blocks, threads>>>(d_C, d_U, d_V, d_B, n);
     cudaDeviceSynchronize();
 
@@ -558,9 +339,12 @@ void solve(float* d_C, int* d_X, float* d_U, float* d_V, int n) {
     cudaMalloc(&d_val, sizeof(float));
 
     int *d_found, *d_i, *d_j;
+    // int *k, *l;
     cudaMalloc(&d_found, sizeof(int));
     cudaMalloc(&d_i, sizeof(int));
     cudaMalloc(&d_j, sizeof(int));
+    // cudaMalloc(&k, sizeof(int));
+    // cudaMalloc(&l, sizeof(int));
 
     float* d_min;
     cudaMalloc(&d_min, sizeof(float));
@@ -590,6 +374,9 @@ void solve(float* d_C, int* d_X, float* d_U, float* d_V, int n) {
     bool* d_changed;
     cudaMalloc(&d_changed, sizeof(int));
 
+    float* d_epsilon;
+    cudaMalloc(&d_epsilon, sizeof(float));
+
     int* d_waiting;
     cudaMalloc(&d_waiting, sizeof(int));
 
@@ -616,7 +403,7 @@ void solve(float* d_C, int* d_X, float* d_U, float* d_V, int n) {
         std::cout << "Step " << steps << ": argmin at B[" << k << "][" << l << "] \n";
 
         // Call solve_from_kl, which returns false if we should stop
-        bool should_continue = solve_from_kl(n, d_C, d_X, d_R, d_Q, d_col_to_row, &k, &l, d_changed, d_waiting, d_U, d_V, d_B, d_found, d_i, d_j, d_min);
+        bool should_continue = solve_from_kl(n, d_C, d_X, d_R, d_Q, d_col_to_row, &k, &l, d_changed, d_waiting, d_epsilon, d_U, d_V, d_B, d_found, d_i, d_j, d_min);
         steps++;
 
         if (!should_continue) {
@@ -635,11 +422,14 @@ void solve(float* d_C, int* d_X, float* d_U, float* d_V, int n) {
     cudaFree(d_Q);
     cudaFree(d_col_to_row);
     cudaFree(d_changed);
+    cudaFree(d_epsilon);
     cudaFree(d_waiting);
 
     cudaFree(d_found);
     cudaFree(d_i);
     cudaFree(d_j);
+    // cudaFree(k);
+    // cudaFree(l);
     cudaFree(d_min);
 }
 
