@@ -320,14 +320,12 @@ __global__ void solve_1bc_persistent(
 {
     // We'll use shared memory for per-block "changed" flag
     __shared__ int block_changed;
-
     // Persistent device-side loop
     while (true) {
         // Step 1: reset block-local flag
         if (threadIdx.x == 0 && threadIdx.y == 0)
             block_changed = 0;
         __syncthreads();
-
         // Step 2: perform the same logic as solve_1bc_kernel
         int i = blockIdx.y * blockDim.y + threadIdx.y;
         int j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -344,17 +342,13 @@ __global__ void solve_1bc_persistent(
                 }
             }
         }
-
         __syncthreads();
-
         // Step 3: reduce to a single global flag
         if (threadIdx.x == 0 && threadIdx.y == 0 && block_changed)
             atomicExch(&d_changed, 1);
-
         // Step 4: global sync — use cooperative groups
         cooperative_groups::grid_group grid = cooperative_groups::this_grid();
         grid.sync();
-
         // Step 5: one thread decides whether to continue
         if (grid.thread_rank() == 0) {
             if (d_changed == 0) {
@@ -363,41 +357,36 @@ __global__ void solve_1bc_persistent(
                 d_changed = 0;   // reset for next iteration
             }
         }
-
         grid.sync();
-
         // Step 6: exit condition
         if (d_changed == -1)
             break;
-
         // then loop again
     }
 }
-
 
 bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d_B, int* d_R, int* d_Q, int* k, int* l) {
     update_Q<<<1,1>>>(d_Q, k, l);
     dim3 threads(16, 16);
     dim3 blocks((n + threads.x - 1) / threads.x, (n + threads.y - 1) / threads.y);
     
-    // int h_changed;
-    // do {
-    //     reset_d_changed<<<1,1>>>();
-        
-    //     solve_1bc_kernel<<<blocks, threads>>>(n, d_X, k, l, d_B, d_R, d_Q);
-        
-    //     cudaMemcpyFromSymbol(&h_changed, d_changed, sizeof(int), 0, cudaMemcpyDeviceToHost);
+    if (n > 350){
+    
+        int h_changed;
+        do {
+            reset_d_changed<<<1,1>>>();
+            
+            solve_1bc_kernel<<<blocks, threads>>>(n, d_X, k, l, d_B, d_R, d_Q);
+            
+            cudaMemcpyFromSymbol(&h_changed, d_changed, sizeof(int), 0, cudaMemcpyDeviceToHost);
 
-    // } while (h_changed == 1);
-
-    // void* kernelArgs[] = { &n, &X, &R, &Q, &B, &d_changed };
-    // cudaLaunchCooperativeKernel(
-    //     (void*)solve_1bc_persistent,
-    //     blocks, threads, kernelArgs
-    // );
-    void* args[] = { &n, &d_X, &k, &l, &d_B, &d_R, &d_Q };
+        } while (h_changed == 1);
+        
+    } else {
+        void* args[] = { &n, &d_X, &k, &l, &d_B, &d_R, &d_Q };
     cudaLaunchCooperativeKernel(
         (void*)solve_1bc_persistent, blocks, threads, args);
+    }
 
     check_Rk<<<1,1>>>(d_R, k, l, n);
     
