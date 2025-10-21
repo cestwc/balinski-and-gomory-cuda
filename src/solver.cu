@@ -291,6 +291,16 @@ __global__ void update_Q(int* d_Q, const int* k, const int* l) {
     d_Q[*l] = *k;
 }
 
+__global__ void update_RQ(int* d_R, int* d_Q, const int* k, const int* l, int* d_col_to_row) {
+    d_Q[*l] = *k;
+    // printf("my *k, %d\n", *k);
+    // printf("my *l, %d\n", *l);
+    // printf("my d_col_to_row[*l], %d\n", d_col_to_row[*l]);
+    d_R[d_col_to_row[*l]] = *l;
+    // printf("my d_col_to_row[*l], %d\n", d_col_to_row[*l]);
+
+}
+
 __global__ void reset_d_changed() {
     d_changed = 0;
 }
@@ -466,19 +476,250 @@ __global__ void collectZeroIndicesSingleKernel(const float* B, int n,
     int start_pos = atomicAdd(global_counter, n);
     int count = 0;
     for (int j = 0; j < n; ++j)
-        if (B[row * n + j] == 0)
+        if (B[IDX2C(row, j, n)] == 0.0f)
             zero_indices[start_pos + count++] = j;
 
     row_start[row] = start_pos;
     row_count[row] = count;
 }
 
+__global__ void compute_col_to_row(int n, const int* X, int* col_to_row) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
 
-bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d_B, int* d_R, int* d_Q, int* k, int* l, int* d_indices, int* d_row_start, int* d_row_count, int* d_counter) {
-    update_Q<<<1,1>>>(d_Q, k, l);
+    for (int i = 0; i < n; ++i) {
+        if (X[IDX2C(i, j, n)] == 1) {
+            col_to_row[j] = i;
+            return;
+        }
+    }
+}
+
+
+// __global__ void init_from_kl(
+//     int n,
+//     const int* __restrict__ d_k,
+//     const int* __restrict__ d_l,
+//     const int* __restrict__ d_col_to_row,
+//     int* __restrict__ d_R,
+//     int* __restrict__ d_Q,
+//     int* __restrict__ d_queue,
+//     int* __restrict__ d_q_head,
+//     int* __restrict__ d_q_tail)
+// {
+//     // Thread 0 does all initialization
+//     if (threadIdx.x == 0 && blockIdx.x == 0) {
+//         int k = *d_k;
+//         int l = *d_l;
+
+//         // 1. Label column l with row k
+//         d_Q[l] = k;
+
+//         // 2. Find which row corresponds to column l
+//         int r = d_col_to_row[l];
+
+//         // 3. Label that row
+//         d_R[r] = l;
+
+//         // 4. Initialize the queue: all n → sentinel, then put r at front
+//         for (int i = 0; i < n; ++i)
+//             d_queue[i] = n;
+//         d_queue[0] = r;
+
+//         // 5. Initialize queue pointers
+//         *d_q_head = 0;
+//         *d_q_tail = 1;
+//     }
+// }
+
+
+
+
+// __global__ void solve_1bc_queue_kernel(
+//     int n,
+//     const int* __restrict__ d_col_to_row,
+//     const int* __restrict__ zero_indices,
+//     const int* __restrict__ row_start,
+//     const int* __restrict__ row_count,
+//     int* __restrict__ R,
+//     int* __restrict__ Q,
+//     int* __restrict__ queue,
+//     int* __restrict__ q_head,
+//     int* __restrict__ q_tail)
+// {
+//     // multiple threads cooperate to pop rows and process them
+//     while (true) {
+//         int my_idx = atomicAdd(q_head, 1);
+//         int cur_tail = atomicAdd(q_tail, 0);
+//         if (my_idx >= cur_tail)
+//             break; // no more work at this moment
+
+//         int row = queue[my_idx];
+
+//         if (R[row] == n) continue; // skip unlabeled rows
+
+//         int base = row_start[row];
+//         int nz   = row_count[row];
+
+//         for (int k = 0; k < nz; ++k) {
+//             int j = zero_indices[base + k];
+//             if (atomicCAS(&Q[j], n, row) == n) {
+//                 int r2 = d_col_to_row[j];
+//                 if (r2 >= 0 && r2 < n) {
+//                     if (atomicCAS(&R[r2], n, j) == n) {
+//                         int pos = atomicAdd(q_tail, 1);
+//                         if (pos < n) queue[pos] = r2;
+//                     }
+//                 }
+//             }
+//         }
+//     }
+// }
+
+
+// Assumptions:
+// - One block per row, blockDim.x == 1
+// - row i's zero columns live at zero_indices[row_start[i] .. row_start[i] + row_count[i]-1]
+// - R[i] == n means row i unlabeled; Q[j] == n means column j unlabeled
+// - d_col_to_row[j] gives the row reached from column j
+
+__global__ void solve_1bc_rowseq_async(
+    int n,
+    const int* __restrict__ d_col_to_row,
+    const int* __restrict__ zero_indices,
+    const int* __restrict__ row_start,
+    const int* __restrict__ row_count,
+    const int *k,
+    int* __restrict__ R,
+    int* __restrict__ Q,
+    int* __restrict__ visited
+) {
+    const int i = blockIdx.x;
+    if (i >= n) return;
+    // if (i == *k) return;
+
+    // Local epoch state (mirrors your older kernel’s pattern)
+    int contributing = 1;      // this worker will contribute to the epoch counter
+    int step = 0;              // worker's local epoch number
+    int local_move = 0;        // seen value of d_moving
+    int doing = 0;             // whether this worker did useful work in this epoch
+    int iteration, accumulate; // epoch arithmetic
+    int old_p, last_out;
+
+    // Number of contributors required to “close” an epoch:
+    const int expected = n;    // one contributor per row-worker
+
+    // Main epoch loop (barrier-free global sync via counters)
+    do {
+        // ---------- WORK PHASE: try to expand from this row if labeled ----------
+        // doing = 0;
+
+        // printf("Blind row: %d, label %d\n", i, R[i]);
+
+        if (R[i] != n && visited[i] == 0) {
+            visited[i] = 1;
+            // printf("row: %d, label %d\n", i, R[i]);
+            doing = 1;  // we made progress this epoch
+
+            // printf("this is i, %d", i);
+
+            if (i != *k){           
+
+                const int base = row_start[i];
+                const int nz   = row_count[i];
+
+                // printf("base, %d\n", base);
+
+                // printf("nz, %d\n", nz);
+
+
+                // Sequential per-row visit over pre-collected zeros
+                // printf("Row %d has %d zero columns:\n", i, nz);
+                for (int index = 0; index < nz; ++index) {
+                    const int j = zero_indices[base + index];
+                    // printf("column j, %d\n", j);
+                    
+
+                    // Column labeling: claim Q[j] if still unlabeled
+                    if (atomicCAS(&Q[j], n, i) == n) {
+                        // If we labeled column j, immediately label the mapped row
+                        const int r2 = d_col_to_row[j];
+                        // printf("Second row: %d, label %d\n", r2, R[r2]);
+
+                        R[r2] = j;
+                        // printf("After Second row: %d, label %d\n", r2, R[r2]);
+                        // if (r2 >= 0 && r2 < n) {
+                            // if (atomicCAS(&R[r2], n, j) == n) {
+                            // }
+                        // }
+                    }
+                }
+            }
+        } else {
+            doing = 0;
+        }
+
+        // Make writes visible globally (labels R/Q) before we account progress
+        __threadfence_system();
+
+        // ---------- EPOCH ACCOUNTING (same pattern as your old code) ----------
+        // Contribute to global progress and possibly to "idle" (outstanding) count.
+        old_p = atomicAdd(&d_progress, contributing);
+        if (contributing == 1 && doing == 0) {
+            atomicAdd(&d_outstanding, 1);  // this worker had no work in this epoch
+        }
+        __threadfence(); // order the counter updates
+
+        // Figure out our epoch index and position within the epoch
+        iteration  = (old_p + contributing) / expected; // which epoch we’re now in
+        accumulate = (old_p + contributing) % expected; // how many contributions so far in this epoch
+
+        // printf("iteration, %d\n", iteration);
+        // printf("accumulate, %d\n", accumulate);
+
+        // If the global epoch (d_moving) has advanced beyond what we’ve seen,
+        // this worker should re-enable its contribution for the next epoch.
+        if (iteration > step && d_moving > local_move) {
+            contributing = 1;
+            step++;
+            local_move++;
+
+            // If we were the last contributor in the epoch (accumulate == 0),
+            // close the epoch: test if everyone was idle; if yes -> stop.
+            if (accumulate == 0) {
+                last_out = atomicExch(&d_outstanding, 0);
+                __threadfence();
+                if (last_out == expected) {
+                    atomicAdd(&d_stop, 1); // all idle in this epoch → stop
+                }
+                // Start next epoch
+                atomicAdd(&d_moving, 1);
+                __threadfence_system();
+
+                // Reset d_progress to 0 for the next epoch (one thread can do it safely here)
+                // Optional if you want progress per-epoch; not mandatory if you rely on arithmetic.
+                // atomicExch(&d_progress, 0);
+            }
+        } else {
+            // Already contributed this epoch; don’t double-count
+            contributing = 0;
+        }
+
+        // Optional tiny backoff to reduce contention
+        // __nanosleep(64);
+
+    } while (d_stop == 0);
+    visited[i] = 0;
+}
+
+
+bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d_B, int* d_R, int* d_Q, int* k, int* l,int* d_col_to_row, int* d_indices, int* d_row_start, int* d_row_count, int* d_counter, int* d_row_visited) {
     dim3 threads(16, 16);
     dim3 blocks((n + threads.x - 1) / threads.x, (n + threads.y - 1) / threads.y);
-    
+    compute_col_to_row<<<blocks, threads>>>(n, d_X, d_col_to_row);
+    // update_Q<<<1,1>>>(d_Q, k, l);
+    update_RQ<<<1,1>>>(d_R, d_Q, k, l, d_col_to_row);
+
     // if (n > 350){
     
         // int h_changed;
@@ -492,18 +733,55 @@ bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d
         // } while (h_changed == 1);
 
     cudaDeviceSynchronize();
+
+
     reset_device_flags<<<1,1>>>();
     count_done_entries<<<blocks, threads>>>(n, d_B);
 
+    
+
     // printDeviceVar("d_done", d_done);
 
-    cudaDeviceSynchronize();
-    solve_1bc_kernel_full<<<blocks, threads>>>(n, d_X, k, d_B, d_R, d_Q);
+    // cudaDeviceSynchronize();
+    // printDeviceMatrix("Before d_B", d_B, n);
+    cudaMemset(d_counter, 0, sizeof(int));
+    collectZeroIndicesSingleKernel<<< (n + 256 - 1) / 256, 256>>>(d_B, n, d_indices, d_row_start, d_row_count, d_counter);
+    // printDeviceVector("d_col_to_row", d_col_to_row, n);
+    // printDeviceVector("d_row_start", d_row_start, n);
+    // printDeviceVector("d_row_count", d_row_count, n);
+
+    // solve_1bc_kernel_full<<<blocks, threads>>>(n, d_X, k, d_B, d_R, d_Q);
+
+    // std::vector<int> h_queue(n, -1);
+    // h_queue[0] = seed_row;
+    // int h_head = 0, h_tail = 1;
+    // cudaMemcpy(d_queue, h_queue.data(), n*sizeof(int), cudaMemcpyHostToDevice);
+    // cudaMemcpy(d_q_head, &h_head, sizeof(int), cudaMemcpyHostToDevice);
+    // cudaMemcpy(d_q_tail, &h_tail, sizeof(int), cudaMemcpyHostToDevice);
+    // init_from_kl<<<1, 1>>>(n, k, l, d_col_to_row,
+    //                    d_R, d_Q, d_queue, d_q_head, d_q_tail);
 
     // int blockSize = 256, gridSize = (n + blockSize - 1) / blockSize;
-    collectZeroIndicesSingleKernel<<< (n + 256 - 1) / 256, 256>>>(
-        d_B, n, d_indices, d_row_start, d_row_count, d_counter);
+    
     cudaDeviceSynchronize();
+
+    solve_1bc_rowseq_async<<<n, 1>>>( n, d_col_to_row, d_indices, d_row_start, d_row_count, k, d_R, d_Q, d_row_visited);
+
+    // printDeviceVector("d_R", d_R, n);
+    // printDeviceVector("d_Q", d_Q, n);
+
+    // printDeviceMatrix("after d_B", d_B, n);
+    // printDeviceVector("d_row_visited", d_row_visited, n);
+
+    // dim3 block2(256);
+    // dim3 grid2((n + block2.x - 1) / block2.x);
+
+    // solve_1bc_queue_kernel<<<grid2, block2>>>(
+    //     n, d_col_to_row,
+    //     d_indices, d_row_start, d_row_count,
+    //     d_R, d_Q,
+    //     d_queue, d_q_head, d_q_tail);
+
     cudaDeviceSynchronize();
         
     // } else {
@@ -513,6 +791,8 @@ bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d
     // }
 
     check_Rk<<<1,1>>>(d_R, k, l, n);
+
+    // printDeviceVar("d_flag", d_flag);
     
 
     int h_flag;
@@ -560,12 +840,25 @@ bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d
 
 void solve(float* d_C, int* d_X, float* d_U, float* d_V, int n) {
     float* d_B;
+    
+    int* d_col_to_row;
+    cudaMalloc(&d_col_to_row, n * sizeof(int));
+    
+    
     int *d_indices, *d_row_start, *d_row_count, *d_counter;
     cudaMalloc(&d_indices, n*n*sizeof(int));
     cudaMalloc(&d_row_start, n*sizeof(int));
     cudaMalloc(&d_row_count, n*sizeof(int));
     cudaMalloc(&d_counter, sizeof(int));
-    cudaMemset(d_counter, 0, sizeof(int));
+    
+
+    // weird
+    // int *d_queue, *d_q_head, *d_q_tail;
+    // cudaMalloc(&d_queue, n * sizeof(int));
+    // cudaMalloc(&d_q_head, sizeof(int));
+    // cudaMalloc(&d_q_tail, sizeof(int));
+
+
 
     cudaMalloc(&d_B, n * n * sizeof(float));
     int *k, *l;
@@ -579,11 +872,16 @@ void solve(float* d_C, int* d_X, float* d_U, float* d_V, int n) {
     cudaMalloc(&d_Q, n * sizeof(int));
     set_array_value<<<(n + 255)/256, 256>>>(d_R, n, n);
     set_array_value<<<(n + 255)/256, 256>>>(d_Q, n, n);
+
+    int* d_row_visited;
+    cudaMalloc(&d_row_visited, n * sizeof(int));
+    set_array_value<<<(n + 255)/256, 256>>>(d_row_visited, 0, n);
+
     find_most_negative<<<blocks, threads>>>(d_B, n, k, l);
     int steps = 0;
     while (true) {
         // std::cout << "Step " << steps << " \n";
-        bool should_continue = solve_from_kl(d_C, d_X, d_U, d_V, n, d_B, d_R, d_Q, k, l, d_indices, d_row_start, d_row_count, d_counter);
+        bool should_continue = solve_from_kl(d_C, d_X, d_U, d_V, n, d_B, d_R, d_Q, k, l, d_col_to_row, d_indices, d_row_start, d_row_count, d_counter, d_row_visited);
         steps++;
         if (!should_continue) {
             // std::cout << "Solver has converged after " << steps << " steps.\n";
@@ -593,13 +891,21 @@ void solve(float* d_C, int* d_X, float* d_U, float* d_V, int n) {
     cudaFree(d_B);
     cudaFree(d_R);
     cudaFree(d_Q);
+    cudaFree(d_row_visited);
+
     cudaFree(k);
     cudaFree(l);
+
+    cudaFree(d_col_to_row);
 
     cudaFree(d_indices);
     cudaFree(d_row_start);
     cudaFree(d_row_count);
     cudaFree(d_counter);
+
+    // cudaFree(d_queue);
+    // cudaFree(d_q_head);
+    // cudaFree(d_q_tail);
 }
 
 
