@@ -713,6 +713,137 @@ __global__ void solve_1bc_rowseq_async(
 }
 
 
+__device__ __forceinline__
+unsigned warp_exclusive_scan(unsigned v) {
+    unsigned lane = threadIdx.x & 31;
+    unsigned n = v;
+    // inclusive scan in 'n'
+    for (int offset = 1; offset < 32; offset <<= 1) {
+        unsigned y = __shfl_up_sync(0xffffffff, n, offset);
+        if (lane >= offset) n += y;
+    }
+    // convert to exclusive
+    return n - v;
+}
+
+// ---------------------------------------------
+// Block exclusive scan over the first n_active threads.
+// - Each thread provides 'flag' (0/1) and receives 'excl' (exclusive prefix).
+// - Returns tile_sum (sum of flags over n_active threads) via shared memory.
+// - Works for arbitrary n_active <= blockDim.x.
+// ---------------------------------------------
+__device__ __forceinline__
+unsigned block_exclusive_scan_0_1(unsigned flag,
+                                  int n_active,
+                                  unsigned &excl) {
+    // Per-warp exclusive scan
+    unsigned lane   = threadIdx.x & 31;
+    unsigned warpId = threadIdx.x >> 5;
+
+    unsigned excl_warp = warp_exclusive_scan(flag);
+    unsigned incl_warp = excl_warp + flag;
+
+    // Number of warps that have active threads
+    int numWarps = (n_active + 31) >> 5;
+
+    // Shared arrays to propagate warp sums
+    __shared__ unsigned warp_sums[32];    // inclusive sum of each warp
+    __shared__ unsigned warp_offsets[32]; // exclusive prefix sum for warps
+
+    // Initialize to zero to avoid stale values for inactive warps
+    if (lane == 0) warp_sums[warpId] = 0;
+    __syncthreads();
+
+    // Identify last active lane in this warp
+    int warp_base = warpId * 32;
+    int last_lane = min(31, max(0, n_active - warp_base - 1));
+    bool is_last_in_warp = (lane == last_lane) && (warpId < (unsigned)numWarps);
+
+    // The last active lane in each warp publishes its INCLUSIVE sum
+    if (is_last_in_warp) {
+        warp_sums[warpId] = incl_warp;
+    }
+    __syncthreads();
+
+    // First warp scans the warp sums (numWarps entries)
+    unsigned warp_excl = 0;
+    if (warpId == 0) {
+        unsigned wval = (lane < (unsigned)numWarps) ? warp_sums[lane] : 0;
+        unsigned wexcl = warp_exclusive_scan(wval);
+        if (lane < (unsigned)numWarps) warp_offsets[lane] = wexcl;
+    }
+    __syncthreads();
+
+    // Each thread's block-exclusive prefix = its warp-exclusive + offset of previous warps
+    unsigned block_offset = (warpId < (unsigned)numWarps) ? warp_offsets[warpId] : 0;
+    excl = (threadIdx.x < n_active) ? (excl_warp + block_offset) : 0;
+
+    // Tile sum is the last warp's inclusive sum + offset of previous warps.
+    // Let the last active thread in the block compute it:
+    __shared__ unsigned tile_sum;
+    if (threadIdx.x == n_active - 1) {
+        unsigned last_warp = (n_active - 1) >> 5;
+        tile_sum = warp_sums[last_warp] + warp_offsets[last_warp];
+    }
+    __syncthreads();
+
+    return tile_sum; // valid for all threads after the sync
+}
+
+// --------------------------------------------------------
+// Kernel: One block per row, shared-memory compaction.
+// Each row writes into a fixed segment [row*n, row*n + count).
+// No atomics. Coalesced reads & writes.
+// Supports n > blockDim.x via tiling over columns.
+// --------------------------------------------------------
+__global__ void collectZeroIndicesSharedMem(const float* __restrict__ B,
+                                            int n,
+                                            int* __restrict__ zero_indices,
+                                            int* __restrict__ row_start,
+                                            int* __restrict__ row_count) {
+    int row = blockIdx.x;
+    if (row >= n) return;
+
+    // Our fixed segment start for this row:
+    const int base_out = row * n;
+    if (threadIdx.x == 0) {
+        row_start[row] = base_out; // deterministic segment per row
+    }
+    __syncthreads();
+
+    unsigned running = 0; // total zeros written so far in this row
+
+    // Tile over columns by blockDim.x
+    for (int base = 0; base < n; base += blockDim.x) {
+        int tid   = threadIdx.x;
+        int col   = base + tid;
+        int active = min(blockDim.x, n - base);
+
+        // Load flag: is zero?
+        unsigned flag = 0;
+        if (tid < active) {
+            flag = (B[IDX2C(row, col, n)] == 0) ? 1u : 0u;
+        }
+
+        // Block-wide exclusive scan of flags over 'active' threads
+        unsigned excl = 0;
+        unsigned tile_sum = block_exclusive_scan_0_1(flag, active, excl);
+
+        // Threads with flag=1 write their column index at compacted position
+        if (tid < active && flag) {
+            zero_indices[base_out + running + excl] = col;
+        }
+
+        // Advance running total
+        if (tid == 0) running += tile_sum;
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        row_count[row] = running;
+    }
+}
+
 bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d_B, int* d_R, int* d_Q, int* k, int* l,int* d_col_to_row, int* d_indices, int* d_row_start, int* d_row_count, int* d_counter, int* d_row_visited) {
     dim3 threads(16, 16);
     dim3 blocks((n + threads.x - 1) / threads.x, (n + threads.y - 1) / threads.y);
@@ -745,7 +876,8 @@ bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d
     // cudaDeviceSynchronize();
     // printDeviceMatrix("Before d_B", d_B, n);
     cudaMemset(d_counter, 0, sizeof(int));
-    collectZeroIndicesSingleKernel<<< (n + 256 - 1) / 256, 256>>>(d_B, n, d_indices, d_row_start, d_row_count, d_counter);
+    // collectZeroIndicesSingleKernel<<< (n + 256 - 1) / 256, 256>>>(d_B, n, d_indices, d_row_start, d_row_count, d_counter);
+    collectZeroIndicesSharedMem<<<n, 512>>>(          d_B, n, d_indices, d_row_start, d_row_count);
     // printDeviceVector("d_col_to_row", d_col_to_row, n);
     // printDeviceVector("d_row_start", d_row_start, n);
     // printDeviceVector("d_row_count", d_row_count, n);
