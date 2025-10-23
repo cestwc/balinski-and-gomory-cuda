@@ -483,234 +483,30 @@ __global__ void collectZeroIndicesSingleKernel(const float* B, int n,
     row_count[row] = count;
 }
 
-__global__ void compute_col_to_row(int n, const int* X, int* col_to_row) {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= n) return;
+// __global__ void compute_col_to_row(int n, const int* X, int* col_to_row) {
+//     int j = blockIdx.x * blockDim.x + threadIdx.x;
+//     if (j >= n) return;
 
-    for (int i = 0; i < n; ++i) {
-        if (X[IDX2C(i, j, n)] == 1) {
-            col_to_row[j] = i;
-            return;
-        }
+//     for (int i = 0; i < n; ++i) {
+//         if (X[IDX2C(i, j, n)] == 1) {
+//             col_to_row[j] = i;
+//             return;
+//         }
+//     }
+// }
+
+__global__ void compute_col_to_row(int n, const int* X, int* col_to_row) {
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (i >= n || j >= n) return;
+
+    if (X[IDX2C(i, j, n)] == 1) {
+        // atomic because multiple threads can write to the same col_to_row[j]
+        col_to_row[j] = i;
     }
 }
 
-
-// __global__ void init_from_kl(
-//     int n,
-//     const int* __restrict__ d_k,
-//     const int* __restrict__ d_l,
-//     const int* __restrict__ d_col_to_row,
-//     int* __restrict__ d_R,
-//     int* __restrict__ d_Q,
-//     int* __restrict__ d_queue,
-//     int* __restrict__ d_q_head,
-//     int* __restrict__ d_q_tail)
-// {
-//     // Thread 0 does all initialization
-//     if (threadIdx.x == 0 && blockIdx.x == 0) {
-//         int k = *d_k;
-//         int l = *d_l;
-
-//         // 1. Label column l with row k
-//         d_Q[l] = k;
-
-//         // 2. Find which row corresponds to column l
-//         int r = d_col_to_row[l];
-
-//         // 3. Label that row
-//         d_R[r] = l;
-
-//         // 4. Initialize the queue: all n → sentinel, then put r at front
-//         for (int i = 0; i < n; ++i)
-//             d_queue[i] = n;
-//         d_queue[0] = r;
-
-//         // 5. Initialize queue pointers
-//         *d_q_head = 0;
-//         *d_q_tail = 1;
-//     }
-// }
-
-
-
-
-// __global__ void solve_1bc_queue_kernel(
-//     int n,
-//     const int* __restrict__ d_col_to_row,
-//     const int* __restrict__ zero_indices,
-//     const int* __restrict__ row_start,
-//     const int* __restrict__ row_count,
-//     int* __restrict__ R,
-//     int* __restrict__ Q,
-//     int* __restrict__ queue,
-//     int* __restrict__ q_head,
-//     int* __restrict__ q_tail)
-// {
-//     // multiple threads cooperate to pop rows and process them
-//     while (true) {
-//         int my_idx = atomicAdd(q_head, 1);
-//         int cur_tail = atomicAdd(q_tail, 0);
-//         if (my_idx >= cur_tail)
-//             break; // no more work at this moment
-
-//         int row = queue[my_idx];
-
-//         if (R[row] == n) continue; // skip unlabeled rows
-
-//         int base = row_start[row];
-//         int nz   = row_count[row];
-
-//         for (int k = 0; k < nz; ++k) {
-//             int j = zero_indices[base + k];
-//             if (atomicCAS(&Q[j], n, row) == n) {
-//                 int r2 = d_col_to_row[j];
-//                 if (r2 >= 0 && r2 < n) {
-//                     if (atomicCAS(&R[r2], n, j) == n) {
-//                         int pos = atomicAdd(q_tail, 1);
-//                         if (pos < n) queue[pos] = r2;
-//                     }
-//                 }
-//             }
-//         }
-//     }
-// }
-
-
-// Assumptions:
-// - One block per row, blockDim.x == 1
-// - row i's zero columns live at zero_indices[row_start[i] .. row_start[i] + row_count[i]-1]
-// - R[i] == n means row i unlabeled; Q[j] == n means column j unlabeled
-// - d_col_to_row[j] gives the row reached from column j
-
-// __global__ void solve_1bc_rowseq_async(
-//     int n,
-//     const int* __restrict__ d_col_to_row,
-//     const int* __restrict__ zero_indices,
-//     const int* __restrict__ row_start,
-//     const int* __restrict__ row_count,
-//     const int *k,
-//     int* __restrict__ R,
-//     int* __restrict__ Q,
-//     int* __restrict__ visited
-// ) {
-//     const int i = blockIdx.x;
-//     if (i >= n) return;
-//     // if (i == *k) return;
-
-//     // Local epoch state (mirrors your older kernel’s pattern)
-//     int contributing = 1;      // this worker will contribute to the epoch counter
-//     int step = 0;              // worker's local epoch number
-//     int local_move = 0;        // seen value of d_moving
-//     int doing = 0;             // whether this worker did useful work in this epoch
-//     int iteration, accumulate; // epoch arithmetic
-//     int old_p, last_out;
-
-//     // Number of contributors required to “close” an epoch:
-//     const int expected = n;    // one contributor per row-worker
-
-//     // Main epoch loop (barrier-free global sync via counters)
-//     do {
-//         // ---------- WORK PHASE: try to expand from this row if labeled ----------
-//         // doing = 0;
-
-//         // printf("Blind row: %d, label %d\n", i, R[i]);
-
-//         if (R[i] != n && visited[i] == 0) {
-//             visited[i] = 1;
-//             // printf("row: %d, label %d\n", i, R[i]);
-//             doing = 1;  // we made progress this epoch
-
-//             // printf("this is i, %d", i);
-
-//             if (i != *k){           
-
-//                 const int base = row_start[i];
-//                 const int nz   = row_count[i];
-
-//                 // printf("base, %d\n", base);
-
-//                 // printf("nz, %d\n", nz);
-
-
-//                 // Sequential per-row visit over pre-collected zeros
-//                 // printf("Row %d has %d zero columns:\n", i, nz);
-//                 for (int index = 0; index < nz; ++index) {
-//                     const int j = zero_indices[base + index];
-//                     // printf("column j, %d\n", j);
-                    
-
-//                     // Column labeling: claim Q[j] if still unlabeled
-//                     if (atomicCAS(&Q[j], n, i) == n) {
-//                         // If we labeled column j, immediately label the mapped row
-//                         const int r2 = d_col_to_row[j];
-//                         // printf("Second row: %d, label %d\n", r2, R[r2]);
-
-//                         R[r2] = j;
-//                         // printf("After Second row: %d, label %d\n", r2, R[r2]);
-//                         // if (r2 >= 0 && r2 < n) {
-//                             // if (atomicCAS(&R[r2], n, j) == n) {
-//                             // }
-//                         // }
-//                     }
-//                 }
-//             }
-//         } else {
-//             doing = 0;
-//         }
-
-//         // Make writes visible globally (labels R/Q) before we account progress
-//         __threadfence_system();
-
-//         // ---------- EPOCH ACCOUNTING (same pattern as your old code) ----------
-//         // Contribute to global progress and possibly to "idle" (outstanding) count.
-//         old_p = atomicAdd(&d_progress, contributing);
-//         if (contributing == 1 && doing == 0) {
-//             atomicAdd(&d_outstanding, 1);  // this worker had no work in this epoch
-//         }
-//         __threadfence(); // order the counter updates
-
-//         // Figure out our epoch index and position within the epoch
-//         iteration  = (old_p + contributing) / expected; // which epoch we’re now in
-//         accumulate = (old_p + contributing) % expected; // how many contributions so far in this epoch
-
-//         // printf("iteration, %d\n", iteration);
-//         // printf("accumulate, %d\n", accumulate);
-
-//         // If the global epoch (d_moving) has advanced beyond what we’ve seen,
-//         // this worker should re-enable its contribution for the next epoch.
-//         if (iteration > step && d_moving > local_move) {
-//             contributing = 1;
-//             step++;
-//             local_move++;
-
-//             // If we were the last contributor in the epoch (accumulate == 0),
-//             // close the epoch: test if everyone was idle; if yes -> stop.
-//             if (accumulate == 0) {
-//                 last_out = atomicExch(&d_outstanding, 0);
-//                 __threadfence();
-//                 if (last_out == expected) {
-//                     atomicAdd(&d_stop, 1); // all idle in this epoch → stop
-//                 }
-//                 // Start next epoch
-//                 atomicAdd(&d_moving, 1);
-//                 __threadfence_system();
-
-//                 // Reset d_progress to 0 for the next epoch (one thread can do it safely here)
-//                 // Optional if you want progress per-epoch; not mandatory if you rely on arithmetic.
-//                 // atomicExch(&d_progress, 0);
-//             }
-//         } else {
-//             // Already contributed this epoch; don’t double-count
-//             contributing = 0;
-//         }
-
-//         // Optional tiny backoff to reduce contention
-//         // __nanosleep(64);
-
-//     } while (d_stop == 0);
-//     visited[i] = 0;
-// }
 
 
 __global__ void solve_1bc_rowseq_async_parallel(
@@ -809,107 +605,6 @@ __global__ void solve_1bc_rowseq_async_parallel(
     if (threadIdx.x == 0)
         visited[i] = 0;
 }
-
-// __global__ void solve_1bc_rowseq_async_parallel(
-//     int n,
-//     const int* __restrict__ d_col_to_row,
-//     const int* __restrict__ zero_indices,
-//     const int* __restrict__ row_start,
-//     const int* __restrict__ row_count,
-//     const int *k,
-//     int* __restrict__ R,
-//     int* __restrict__ Q,
-//     int* __restrict__ visited
-// ) {
-//     const int i = blockIdx.x;
-//     if (i >= n) return;
-
-//     // One thread per block handles epoch bookkeeping
-//     int contributing = 1;
-//     int step = 0;
-//     int local_move = 0;
-//     const int expected = n; // total row-workers
-//     int old_p, last_out, iteration, accumulate;
-
-//     // Main epoch loop
-//     do {
-//         // Shared flag for intra-block work progress
-//         __shared__ int block_doing;
-//         if (threadIdx.x == 0) block_doing = 0;
-//         __syncthreads();
-
-//         // WORK PHASE: all threads in the block cooperate
-//         if (R[i] != n && visited[i] == 0) {
-//             if (threadIdx.x == 0)
-//                 visited[i] = 1;
-
-//             __syncthreads();
-
-//             if (i != *k) {
-//                 const int base = row_start[i];
-//                 const int nz   = row_count[i];
-//                 int local_doing = 0;
-
-//                 // Each thread processes a subset of the row’s columns
-//                 for (int t = threadIdx.x; t < nz; t += blockDim.x) {
-//                     const int j = zero_indices[base + t];
-
-//                     // Global atomic: column labeling (must remain atomic)
-//                     if (atomicCAS(&Q[j], n, i) == n) {
-//                         const int r2 = d_col_to_row[j];
-//                         R[r2] = j;
-//                         local_doing = 1;
-//                     }
-//                 }
-
-//                 // Simple shared flag (no atomic needed)
-//                 if (local_doing)
-//                     block_doing = 1;
-//             }
-//         }
-
-//         __syncthreads();
-//         int doing = block_doing;
-//         __threadfence_system();
-
-//         // EPOCH ACCOUNTING: only one thread per block
-//         if (threadIdx.x == 0) {
-//             old_p = atomicAdd(&d_progress, contributing);
-
-//             if (contributing == 1 && doing == 0)
-//                 atomicAdd(&d_outstanding, 1);
-
-//             __threadfence();
-
-//             iteration  = (old_p + contributing) / expected;
-//             accumulate = (old_p + contributing) % expected;
-
-//             if (iteration > step && d_moving > local_move) {
-//                 contributing = 1;
-//                 step++;
-//                 local_move++;
-
-//                 if (accumulate == 0) {
-//                     last_out = atomicExch(&d_outstanding, 0);
-//                     __threadfence();
-//                     if (last_out == expected)
-//                         atomicAdd(&d_stop, 1);
-
-//                     atomicAdd(&d_moving, 1);
-//                     __threadfence_system();
-//                 }
-//             } else {
-//                 contributing = 0;
-//             }
-//         }
-
-//         __syncthreads();
-//     } while (d_stop == 0);
-
-//     if (threadIdx.x == 0)
-//         visited[i] = 0;
-// }
-
 
 
 __device__ __forceinline__
@@ -1115,7 +810,7 @@ bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d
     //     d_R, d_Q,
     //     d_queue, d_q_head, d_q_tail);
 
-    cudaDeviceSynchronize();
+    // cudaDeviceSynchronize();
         
     // } else {
     //     void* args[] = { &n, &d_X, &k, &l, &d_B, &d_R, &d_Q };
