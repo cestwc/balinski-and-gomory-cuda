@@ -585,102 +585,289 @@ __global__ void compute_col_to_row(int n, const int* X, int* col_to_row) {
 
 
 
+// __global__ void solve_1bc_rowseq_async_parallel(
+//     int n,
+//     const int* __restrict__ d_col_to_row,
+//     const int* __restrict__ zero_indices,
+//     const int* __restrict__ row_start,
+//     const int* __restrict__ row_count,
+//     const int *k,
+//     int* __restrict__ R,
+//     int* __restrict__ Q,
+//     int* __restrict__ visited
+// ) {
+//     const int i = blockIdx.x;
+//     if (i >= n) return;
+
+//     // Shared memory for block coordination
+//     __shared__ int block_doing; // whether any thread in this block did work this epoch
+
+//     // One thread per block will handle epoch counters
+//     int step = 0, local_move = 0;
+//     int contributing = 1;
+//     const int expected = n; // total row-workers
+//     int iteration, accumulate;
+//     int old_p, last_out;
+
+//     do {
+//         if (threadIdx.x == 0) block_doing = 0;
+//         // __syncthreads();
+
+//         // WORK PHASE: all threads in the block collaborate
+//         if (R[i] != n && visited[i] == 0) {
+//             if (threadIdx.x == 0)
+//                 visited[i] = 1;
+
+//             // __syncthreads();
+
+//             if (i != *k) {
+//                 const int base = row_start[i];
+//                 const int nz   = row_count[i];
+
+//                 // Divide the zero_indices work among threads
+//                 for (int t = threadIdx.x; t < nz; t += blockDim.x) {
+//                     const int j = zero_indices[base + t];
+
+//                     if (atomicCAS(&Q[j], n, i) == n) {
+//                         const int r2 = d_col_to_row[j];
+//                         R[r2] = j;
+//                         // atomicExch(&block_doing, 1);
+//                         block_doing = 1;
+//                     }
+//                 }
+//             }
+//         }
+
+//         // __syncthreads();
+//         // __threadfence_system();
+
+//         // One thread per block performs epoch accounting
+//         if (threadIdx.x == 0) {
+//             int doing = block_doing;
+
+//             old_p = atomicAdd(&d_progress, contributing);
+//             if (contributing == 1 && doing == 0) {
+//                 atomicAdd(&d_outstanding, 1);
+//             }
+//             // __threadfence();
+
+//             iteration  = (old_p + contributing) / expected;
+//             accumulate = (old_p + contributing) % expected;
+
+//             if (iteration > step && d_moving > local_move) {
+//                 contributing = 1;
+//                 step++;
+//                 local_move++;
+
+//                 if (accumulate == 0) {
+//                     last_out = atomicExch(&d_outstanding, 0);
+//                     // __threadfence();
+//                     if (last_out == expected) {
+//                         atomicAdd(&d_stop, 1);
+//                     }
+//                     atomicAdd(&d_moving, 1);
+//                     // __threadfence_system();
+//                     __threadfence();
+//                 }
+//             } else {
+//                 contributing = 0;
+//             }
+//         }
+
+//         // __syncthreads();
+
+//     } while (d_stop == 0);
+
+//     if (threadIdx.x == 0)
+//         visited[i] = 0;
+// }
+
+// __global__ void solve_1bc_rowseq_async_parallel(
+//     int n,
+//     const int* __restrict__ d_col_to_row,
+//     const int* __restrict__ zero_indices,
+//     const int* __restrict__ row_start,
+//     const int* __restrict__ row_count,
+//     const int* k,
+//     int* __restrict__ R,
+//     int* __restrict__ Q
+// ) {
+//     // This version runs on a single block with many threads.
+//     // The "queue" concept is implicit — we repeatedly scan until convergence.
+
+//     // extern __shared__ int shmem[];
+//     __shared__ int changed;
+
+//     const int tid = threadIdx.x;
+//     const int T   = blockDim.x;
+
+//     // Only launch one block
+//     if (blockIdx.x > 0) return;
+
+//     do {
+//         if (tid == 0) changed = 0;
+//         __syncthreads();
+
+//         // Each thread processes multiple rows
+//         for (int i = tid; i < n; i += T) {
+//             if (R[i] != n && i != *k) {
+//                 int base = row_start[i];
+//                 int nz   = row_count[i];
+//                 for (int t = 0; t < nz; ++t) {
+//                     int j = zero_indices[base + t];
+
+//                     // Try to label this column j with row i
+//                     if (atomicCAS(&Q[j], n, i) == n) {
+//                         int r2 = d_col_to_row[j];
+//                         R[r2] = j;
+//                         changed = 1;  // mark that we updated something
+//                     }
+//                 }
+//             }
+//         }
+
+//         __syncthreads();
+
+//         // Continue until no changes were made in this pass
+//     } while (changed);
+// }
+
+
+
+
+// __global__ void solve_1bc_rowseq_async_parallel(
+//     int n,
+//     const int* __restrict__ d_col_to_row,
+//     const int* __restrict__ zero_indices,
+//     const int* __restrict__ row_start,
+//     const int* __restrict__ row_count,
+//     const int* k,
+//     int* __restrict__ R,
+//     int* __restrict__ Q
+// ) {
+//     // Single block, many threads. Asynchronous propagation by repeated sweeps.
+//     if (blockIdx.x > 0) return;
+
+//     __shared__ int changed;
+//     const int tid = threadIdx.x;
+//     const int T   = blockDim.x;
+
+//     do {
+//         if (tid == 0) changed = 0;
+//         __syncthreads();
+
+//         // Each thread processes multiple rows
+//         for (int i = tid; i < n; i += T) {
+//             // Process only rows that are currently labeled and not the special row *k
+//             if (i != *k && R[i] != n) {
+//                 const int base = row_start[i];
+//                 const int nz   = row_count[i];
+
+//                 // Walk this row's zeros
+//                 for (int t = 0; t < nz; ++t) {
+//                     const int j = zero_indices[base + t];
+
+//                     // Try to claim column j for row i
+//                     if (atomicCAS(&Q[j], n, i) == n) {
+//                         const int r2 = d_col_to_row[j];
+
+//                         // First-writer-wins on R as well to avoid races
+//                         if (atomicCAS(&R[r2], n, j) == n) {
+//                             // Mark that the sweep made progress
+//                             atomicExch(&changed, 1);
+//                         }
+//                     }
+//                 }
+//             }
+//         }
+
+//         // Ensure all global writes to R/Q are visible to the whole block
+//         __threadfence_block();
+//         __syncthreads();
+
+//         // Continue until no changes were made in this sweep
+//     } while (changed);
+// }
+
+// Drop-in replacement: same signature, same inputs.
+// Requires cooperative launch support (cg::this_grid()).
+
+#include <cooperative_groups.h>
+namespace cg = cooperative_groups;
+
+// Single device-side flag for grid-wide "did anything change?" tracking.
+// This does NOT alter/repurpose any user input arrays.
+// __device__ int d_changed; # reuse
+
 __global__ void solve_1bc_rowseq_async_parallel(
     int n,
     const int* __restrict__ d_col_to_row,
     const int* __restrict__ zero_indices,
     const int* __restrict__ row_start,
     const int* __restrict__ row_count,
-    const int *k,
+    const int* k,
     int* __restrict__ R,
-    int* __restrict__ Q,
-    int* __restrict__ visited
+    int* __restrict__ Q
 ) {
-    const int i = blockIdx.x;
-    if (i >= n) return;
+    // Make the whole grid cooperative
+    cg::grid_group grid = cg::this_grid();
 
-    // Shared memory for block coordination
-    __shared__ int block_doing; // whether any thread in this block did work this epoch
+    const int tid = threadIdx.x;
+    const int T   = blockDim.x;
+    const int B   = gridDim.x;
+    const int bid = blockIdx.x;
 
-    // One thread per block will handle epoch counters
-    int step = 0, local_move = 0;
-    int contributing = 1;
-    const int expected = n; // total row-workers
-    int iteration, accumulate;
-    int old_p, last_out;
+    // Cooperative asynchronous propagation by repeated sweeps.
+    while (true) {
+        // One thread in the grid clears the global "changed" flag
+        if (bid == 0 && tid == 0) d_changed = 0;
+        // Ensure the clear is visible before anyone writes to it
+        __threadfence();
+        grid.sync();
 
-    do {
-        if (threadIdx.x == 0) block_doing = 0;
-        // __syncthreads();
-
-        // WORK PHASE: all threads in the block collaborate
-        if (R[i] != n && visited[i] == 0) {
-            if (threadIdx.x == 0)
-                visited[i] = 1;
-
-            // __syncthreads();
-
-            if (i != *k) {
+        // Row assignment:
+        // 1) Each block is responsible for a row index equal to its blockIdx.x
+        // 2) If n > gridDim.x, blocks take extra rows in strides of gridDim.x
+        for (int i = bid; i < n; i += B) {
+            // Skip special row *k and rows already at sentinel (R[i] == n means "unclaimed")
+            if (i != *k && R[i] != n) {
                 const int base = row_start[i];
                 const int nz   = row_count[i];
 
-                // Divide the zero_indices work among threads
-                for (int t = threadIdx.x; t < nz; t += blockDim.x) {
+                // 3) Within the row, threads cover all j by striding over nz
+                for (int t = tid; t < nz; t += T) {
                     const int j = zero_indices[base + t];
 
+                    // Try to claim column j for row i (first-writer-wins)
                     if (atomicCAS(&Q[j], n, i) == n) {
                         const int r2 = d_col_to_row[j];
-                        R[r2] = j;
-                        // atomicExch(&block_doing, 1);
-                        block_doing = 1;
+
+                        // Also first-writer-wins on R[r2] to avoid races
+                        if (atomicCAS(&R[r2], n, j) == n) {
+                            // Mark that this sweep made progress (grid-wide flag)
+                            atomicExch(&d_changed, 1);
+                        }
                     }
                 }
             }
         }
 
-        // __syncthreads();
-        // __threadfence_system();
+        // Make sure all global writes to R/Q/d_changed are visible before the decision
+        __threadfence();
+        grid.sync();
 
-        // One thread per block performs epoch accounting
-        if (threadIdx.x == 0) {
-            int doing = block_doing;
+        // Read the global change flag (all threads read the same location)
+        int any_changed = d_changed;
 
-            old_p = atomicAdd(&d_progress, contributing);
-            if (contributing == 1 && doing == 0) {
-                atomicAdd(&d_outstanding, 1);
-            }
-            // __threadfence();
+        // If no changes, we’re done
+        if (!any_changed) break;
 
-            iteration  = (old_p + contributing) / expected;
-            accumulate = (old_p + contributing) % expected;
-
-            if (iteration > step && d_moving > local_move) {
-                contributing = 1;
-                step++;
-                local_move++;
-
-                if (accumulate == 0) {
-                    last_out = atomicExch(&d_outstanding, 0);
-                    // __threadfence();
-                    if (last_out == expected) {
-                        atomicAdd(&d_stop, 1);
-                    }
-                    atomicAdd(&d_moving, 1);
-                    // __threadfence_system();
-                    __threadfence();
-                }
-            } else {
-                contributing = 0;
-            }
-        }
-
-        // __syncthreads();
-
-    } while (d_stop == 0);
-
-    if (threadIdx.x == 0)
-        visited[i] = 0;
+        // Otherwise continue to next sweep
+        grid.sync();
+    }
 }
+
+
 
 
 __device__ __forceinline__
@@ -984,7 +1171,12 @@ bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d
     cudaDeviceSynchronize();
 
     // solve_1bc_rowseq_async<<<n, 1>>>( n, d_col_to_row, d_indices, d_row_start, d_row_count, k, d_R, d_Q, d_row_visited);
-    solve_1bc_rowseq_async_parallel<<<n, 128>>>( n, d_col_to_row, d_indices, d_row_start, d_row_count, k, d_R, d_Q, d_row_visited);
+    // solve_1bc_rowseq_async_parallel<<<1, 512>>>( n, d_col_to_row, d_indices, d_row_start, d_row_count, k, d_R, d_Q);
+    void* args[] = { &n, &d_col_to_row, &d_indices, &d_row_start, &d_row_count, &k, &d_R, &d_Q };
+    cudaLaunchCooperativeKernel(
+        (void*)solve_1bc_rowseq_async_parallel, 160, 256, args
+    );
+
 
 
     // printDeviceVector("d_R", d_R, n);
