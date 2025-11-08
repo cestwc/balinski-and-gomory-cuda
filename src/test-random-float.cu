@@ -113,7 +113,7 @@ int main(int argc, char* argv[]) {
     compute_V_from_C_and_X(h_C, h_X, h_V, n);
 
     // Print initialized values
-    print_matrix(h_C, n, "Matrix C");
+    if (n < 20)  print_matrix(h_C, n, "Matrix C");
     // print_matrix(reinterpret_cast<float*>(h_X), n, "Mask X");
     // print_matrix(h_X, n, "Mask X");
     // print_vector(h_U, n, "Vector U");
