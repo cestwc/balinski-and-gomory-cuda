@@ -1170,30 +1170,211 @@ __global__ void identify_and_flip_singleblock(const int* R, const int* Q,
     }
 }
 
+
+// global convergence flag (device-side)
+// __device__ volatile int d_changed;
+
+// __global__ void solve_1bc_persistent(
+//     int n,
+//     const int* __restrict__ X,
+//     const int* __restrict__ k,
+//     const float* __restrict__ B,
+//     int* __restrict__ R,
+//     int* __restrict__ Q)
+// {
+//     cg::grid_group grid = cg::this_grid();
+//     __shared__ int block_changed;
+
+//     // Each block handles one or more rows: i = blockIdx.x, i += gridDim.x
+//     while (true) {
+//         if (threadIdx.x == 0) block_changed = 0;
+//         __syncthreads();
+
+//         int k_val = *k;
+
+//         for (int i = blockIdx.x; i < n; i += gridDim.x) {
+//             for (int j = threadIdx.x; j < n; j += blockDim.x) {
+
+//                 int Ri = R[i];
+//                 if (Ri == n) {
+//                     int Qj = Q[j];
+//                     if (Qj != n && X[IDX2C(i, j, n)] == 1) {
+//                         if (atomicCAS(&R[i], n, j) == n)
+//                             block_changed = 1;
+//                     }
+//                 }
+
+//                 int Ri_now = R[i];
+//                 if (i != k_val && Ri_now != n) {
+//                     int Qj_now = Q[j];
+//                     if (Qj_now == n && B[IDX2C(i, j, n)] == 0.0f) {
+//                         if (atomicMin(&Q[j], i) > i)
+//                             block_changed = 1;
+//                     }
+//                 }
+//             }
+//             __syncthreads();
+//         }
+
+//         __syncthreads();
+//         __threadfence();
+
+//         if (threadIdx.x == 0 && block_changed)
+//             atomicExch(&d_changed, 1);
+
+//         grid.sync();
+
+//         if (grid.thread_rank() == 0) {
+//             if (d_changed == 0)
+//                 d_changed = -1;
+//             else
+//                 d_changed = 0;
+//         }
+
+//         grid.sync();
+//         if (d_changed == -1) break;
+//     }
+// }
+
+// __global__ void solve_1bc_persistent(
+//     int n, const int* X, int* k, int* l,
+//     const float* B, int* R, int* Q)
+// {
+//     __shared__ int block_changed;
+
+//     while (true) {
+//         // Step 1: reset block-local flag
+//         if (threadIdx.x == 0 && threadIdx.y == 0)
+//             block_changed = 0;
+//         __syncthreads();
+
+//         // Step 2: perform the same logic as solve_1bc_kernel
+//         int i = blockIdx.y * blockDim.y + threadIdx.y;
+//         int j = blockIdx.x * blockDim.x + threadIdx.x;
+//         if (i < n && j < n) {
+//             if (Q[j] != n && X[IDX2C(i, j, n)] == 1) {
+//                 if (atomicCAS(&R[i], n, j) == n)
+//                     block_changed = 1;
+//             }
+//             if (i != *k && R[i] != n && Q[j] == n) {
+//                 float b_val = B[IDX2C(i, j, n)];
+//                 if (b_val == 0.0f) {
+//                     if (atomicMin(&Q[j], i) > i)
+//                         block_changed = 1;
+//                 }
+//             }
+//         }
+
+//         __syncthreads();
+
+//         // Step 3: reduce to a single global flag
+//         if (threadIdx.x == 0 && threadIdx.y == 0 && block_changed)
+//             atomicExch(&d_changed, 1);
+
+//         // Step 4: global sync — use cooperative groups
+//         cooperative_groups::grid_group grid = cooperative_groups::this_grid();
+//         grid.sync();
+
+//         // Step 5: one thread decides whether to continue
+//         if (grid.thread_rank() == 0) {
+//             if (d_changed == 0) {
+//                 d_changed = -1;  // signal exit
+//             } else {
+//                 d_changed = 0;   // reset for next iteration
+//             }
+//         }
+
+//         grid.sync();
+
+//         // Step 6: exit condition
+//         if (d_changed == -1)
+//             break;
+
+//         // then loop again
+//     }
+// }
+
+__global__ void solve_1bc_persistent(
+    int n, const int* X, int* k, int* l,
+    const float* B, int* R, int* Q)
+{
+    __shared__ int block_changed;
+
+    // Create cooperative grid group
+    cg::grid_group grid = cg::this_grid();
+
+    while (true) {
+        // Step 1: reset block-local flag
+        if (threadIdx.x == 0 && threadIdx.y == 0)
+            block_changed = 0;
+        __syncthreads();
+
+        // Step 2: iterate over all rows/cols with grid-stride loops
+        for (int i = blockIdx.y * blockDim.y + threadIdx.y;
+             i < n;
+             i += gridDim.y * blockDim.y)
+        {
+            for (int j = blockIdx.x * blockDim.x + threadIdx.x;
+                 j < n;
+                 j += gridDim.x * blockDim.x)
+            {
+                // printf("i %d, j %d\n", i, j);
+                // --- main logic ---
+                if (Q[j] != n && X[IDX2C(i, j, n)] == 1) {
+                    if (atomicCAS(&R[i], n, j) == n)
+                        block_changed = 1;
+                }
+
+                if (i != *k && R[i] != n && Q[j] == n) {
+                    float b_val = B[IDX2C(i, j, n)];
+                    if (b_val == 0.0f) {
+                        if (atomicMin(&Q[j], i) > i)
+                            block_changed = 1;
+                    }
+                }
+            }
+        }
+
+        __syncthreads();
+
+        // Step 3: reduce to a single global flag
+        if (threadIdx.x == 0 && threadIdx.y == 0 && block_changed)
+            atomicExch(&d_changed, 1);
+
+        // Step 4: global sync — wait for all blocks
+        grid.sync();
+
+        // Step 5: one thread decides whether to continue
+        if (grid.thread_rank() == 0) {
+            if (d_changed == 0) {
+                d_changed = -1;  // signal exit
+            } else {
+                d_changed = 0;   // reset for next iteration
+            }
+        }
+
+        grid.sync();
+
+        // Step 6: exit condition
+        if (d_changed == -1)
+            break;
+    }
+}
+
+
 bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d_B, int* d_R, int* d_Q, int* k, int* l,int* d_col_to_row, int* d_indices, int* d_row_start, int* d_row_count, int* d_counter, int* d_row_visited, int* d_next_i, int* d_next_j, int* d_parity, int* d_fR, int* d_fQ, unsigned char* d_hasPredR, unsigned char* d_hasPredQ, unsigned char* d_cycR, unsigned char* d_cycQ) {
     dim3 threads(16, 16);
     dim3 blocks((n + threads.x - 1) / threads.x, (n + threads.y - 1) / threads.y);
     compute_col_to_row<<<blocks, threads>>>(n, d_X, d_col_to_row);
-    // update_Q<<<1,1>>>(d_Q, k, l);
-    update_RQ<<<1,1>>>(d_R, d_Q, k, l, d_col_to_row);
+    update_Q<<<1,1>>>(d_Q, k, l);
+    // update_RQ<<<1,1>>>(d_R, d_Q, k, l, d_col_to_row);
 
-    // if (n > 350){
-    
-        // int h_changed;
-        // do {
-        //     reset_d_changed<<<1,1>>>();
-            
-        //     solve_1bc_kernel<<<blocks, threads>>>(n, d_X, k, l, d_B, d_R, d_Q);
-            
-        //     cudaMemcpyFromSymbol(&h_changed, d_changed, sizeof(int), 0, cudaMemcpyDeviceToHost);
-
-        // } while (h_changed == 1);
-
-    cudaDeviceSynchronize();
+    reset_d_changed<<<1,1>>>();         
 
 
-    reset_device_flags<<<1,1>>>();
-    count_done_entries<<<blocks, threads>>>(n, d_B);
+
+    // reset_device_flags<<<1,1>>>();
+    // count_done_entries<<<blocks, threads>>>(n, d_B);
 
     
 
@@ -1201,9 +1382,9 @@ bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d
 
     // cudaDeviceSynchronize();
     // printDeviceMatrix("Before d_B", d_B, n);
-    cudaMemset(d_counter, 0, sizeof(int));
+    // cudaMemset(d_counter, 0, sizeof(int));
     // collectZeroIndicesSingleKernel<<< (n + 256 - 1) / 256, 256>>>(d_B, n, d_indices, d_row_start, d_row_count, d_counter);
-    collectZeroIndicesSharedMem<<<n, 512>>>(          d_B, n, d_indices, d_row_start, d_row_count);
+    // collectZeroIndicesSharedMem<<<n, 512>>>(          d_B, n, d_indices, d_row_start, d_row_count);
     // printDeviceVector("d_col_to_row", d_col_to_row, n);
     // printDeviceVector("d_row_start", d_row_start, n);
     // printDeviceVector("d_row_count", d_row_count, n);
@@ -1221,15 +1402,23 @@ bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d
 
     // int blockSize = 256, gridSize = (n + blockSize - 1) / blockSize;
     
-    cudaDeviceSynchronize();
+    // cudaDeviceSynchronize();
 
     // solve_1bc_rowseq_async_parallel_nb<<<n, 128>>>( n, d_col_to_row, d_indices, d_row_start, d_row_count, k, d_R, d_Q, d_row_visited);
     // solve_1bc_rowseq_async_parallel_sb<<<1, 1024>>>( n, d_col_to_row, d_indices, d_row_start, d_row_count, k, d_R, d_Q);
     // solve_1bc_rowseq_async_parallel_sba<<<1, 1024>>>( n, d_col_to_row, d_indices, d_row_start, d_row_count, k, d_R, d_Q);
-    void* args[] = { &n, &d_col_to_row, &d_indices, &d_row_start, &d_row_count, &k, &d_R, &d_Q };
-    cudaLaunchCooperativeKernel(
-        (void*)solve_1bc_rowseq_async_parallel_cg, 352, 256, args
-    );
+    // void* args[] = { &n, &d_col_to_row, &d_indices, &d_row_start, &d_row_count, &k, &d_R, &d_Q };
+    // cudaLaunchCooperativeKernel(
+    //     (void*)solve_1bc_rowseq_async_parallel_cg, 352, 256, args
+    // );
+
+
+    void* args[] = { &n, &d_X, &k, &l, &d_B, &d_R, &d_Q };
+    cudaLaunchCooperativeKernel((void*)solve_1bc_persistent,  dim3(22,22),  dim3(16,16), args);
+    cudaDeviceSynchronize();
+
+    
+
 
 
 

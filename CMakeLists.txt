@@ -7,7 +7,7 @@ set(CMAKE_CUDA_ARCHITECTURES "native")
 # Or specify a list of architectures to target (optional)
 # Comment out one of these two if you want to use only one method
 # set(CMAKE_CUDA_ARCHITECTURES "native")  
-# set(CMAKE_CUDA_ARCHITECTURES 75 80 86 90)  # e.g., for Turing (7.5), Ampere (8.6)
+set(CMAKE_CUDA_ARCHITECTURES 75 80 86 90)  # e.g., for Turing (7.5), Ampere (8.6)
 
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
