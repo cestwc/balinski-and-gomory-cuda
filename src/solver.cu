@@ -282,6 +282,82 @@ __global__ void process_cycle(float* B, float* V, int* d_X, const int* d_R, cons
     V[*l] += B[IDX2C(*k, *l, n)];
 }
 
+__global__ void update_V(float* B, float* V, int* d_X, const int* d_R, const int* d_Q, int n, int* k, int* l) {
+    // int k_ = *k;
+    // int l_ = *l;
+    // while (true) {
+    //     d_X[IDX2C(k_, l_, n)] = 1;
+    //     l_ = d_R[k_];
+    //     d_X[IDX2C(k_, l_, n)] = 0;
+    //     k_ = d_Q[l_];
+    //     if (k_ == *k && l_ == *l) break;
+    // }
+    V[*l] += B[IDX2C(*k, *l, n)];
+}
+
+__global__ void init_mapping(const int* R, const int* Q,
+                             int* next_i, int* next_j,
+                             int* parity, int n) {
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || j >= n) return;
+
+    int idx = i * n + j;
+
+    // successor pair
+    next_i[idx] = Q[j];
+    next_j[idx] = R[i];
+
+    // parity bit: row→col = 1 (odd)
+    parity[idx] = 1;
+}
+
+__global__ void pointer_jump_cycle(int* next_i, int* next_j,
+                                   int* parity, int n) {
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || j >= n) return;
+
+    int idx = i * n + j;
+    int rounds = ceilf(log2f((float)n));
+
+    for (int r = 0; r < rounds; ++r) {
+        int ni = next_i[idx];
+        int nj = next_j[idx];
+        int next_idx = ni * n + nj;
+
+        int ni2 = next_i[next_idx];
+        int nj2 = next_j[next_idx];
+
+        // jump twice as far
+        next_i[idx] = ni2;
+        next_j[idx] = nj2;
+
+        // combine parity with successor’s parity
+        parity[idx] ^= parity[next_idx];
+
+        __syncthreads(); // optional safety if small grids reuse data
+    }
+}
+
+
+__global__ void update_dX(const int* next_i, const int* next_j,
+                          const int* parity, int* d_X, int n) {
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || j >= n) return;
+
+    int idx = i * n + j;
+
+    // Check if this (i,j) is part of a cycle
+    bool in_cycle = (next_i[idx] == i && next_j[idx] == j);
+    if (!in_cycle) return;
+
+    // Update based on parity
+    d_X[idx] = parity[idx];  // 1 for row→col, 0 for col→row
+}
+
+
 __global__ void finalize_epsilon(const float* d_B, int n, int* k, int* l) {
     if (isinf(d_min)) d_epsilon = -d_B[IDX2C(*k, *l, n)];
     else d_epsilon = d_min;
@@ -738,7 +814,123 @@ __global__ void collectZeroIndicesSharedMem(const float* __restrict__ B,
     }
 }
 
-bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d_B, int* d_R, int* d_Q, int* k, int* l,int* d_col_to_row, int* d_indices, int* d_row_start, int* d_row_count, int* d_counter, int* d_row_visited) {
+// ============================================================================
+// Device helper: build composed mappings
+// fR[i] = Q[R[i]]   (row → column → row)
+// fQ[j] = R[Q[j]]   (column → row → column)
+// Dead-end (index ≥ n) maps to itself.
+// ============================================================================
+__device__ void build_composed_maps_dev(const int* R, const int* Q,
+                                        int n, int tid, int stride,
+                                        int* fR, int* fQ)
+{
+    for (int x = tid; x < n; x += stride) {
+        int r = R[x];
+        if (r >= n) fR[x] = x;
+        else {
+            int q = Q[r];
+            fR[x] = (q >= n ? x : q);
+        }
+
+        int q0 = Q[x];
+        if (q0 >= n) fQ[x] = x;
+        else {
+            int r2 = R[q0];
+            fQ[x] = (r2 >= n ? x : r2);
+        }
+    }
+}
+
+// ============================================================================
+// Device helper: pointer-jumping (path-doubling)
+// Repeatedly compresses mappings until convergence.
+// ============================================================================
+__device__ void power_double_dev(int* fR, int* fQ, int n, int tid, int stride)
+{
+    for (int x = tid; x < n; x += stride) {
+        fR[x] = fR[fR[x]];
+        fQ[x] = fQ[fQ[x]];
+    }
+}
+
+// ============================================================================
+// Main kernel: identify the (*k,*l) cycle and flip entries in X along it.
+//  - Parallelized within a single block using __syncthreads()
+//  - Works fully on device, no host intervention.
+// ============================================================================
+__global__ void identify_and_flip_singleblock(const int* R, const int* Q,
+                                              int* X, int n,
+                                              const int* k, const int* l,
+                                              int* fR, int* fQ,
+                                              unsigned char* hasPredR,
+                                              unsigned char* hasPredQ,
+                                              unsigned char* cycR,
+                                              unsigned char* cycQ)
+{
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+
+    // Dereference k and l (device pointers)
+    int k_ = *k;
+    int l_ = *l;
+
+    // Step 1. Build composed maps fR, fQ
+    build_composed_maps_dev(R, Q, n, tid, stride, fR, fQ);
+    __syncthreads();
+
+    // Step 2. Pointer-jumping: log(n) doubling steps
+    int rounds = 0; for (int t = n; t > 1; t >>= 1) ++rounds;
+    for (int r = 0; r < rounds; ++r) {
+        power_double_dev(fR, fQ, n, tid, stride);
+        __syncthreads();
+    }
+
+    // Step 3. Shared representative broadcast
+    __shared__ int repR, repQ;
+    if (tid == 0) {
+        repR = fR[k_];
+        repQ = fQ[l_];
+    }
+    __syncthreads();
+
+    // Step 4. Mark candidate cycle members and reset predecessor flags
+    for (int x = tid; x < n; x += stride) {
+        cycR[x] = (fR[x] == repR);
+        cycQ[x] = (fQ[x] == repQ);
+        hasPredR[x] = 0;
+        hasPredQ[x] = 0;
+    }
+    __syncthreads();
+
+    // Step 5. Mark nodes that have predecessors within their candidate set
+    for (int u = tid; u < n; u += stride) {
+        if (cycR[u]) hasPredR[fR[u]] = 1;
+        if (cycQ[u]) hasPredQ[fQ[u]] = 1;
+    }
+    __syncthreads();
+
+    // Step 6. Finalize true cycle membership
+    for (int x = tid; x < n; x += stride) {
+        cycR[x] = (cycR[x] && hasPredR[x]);
+        cycQ[x] = (cycQ[x] && hasPredQ[x]);
+    }
+    __syncthreads();
+
+    // Step 7. Flip all entries in X that lie on the (k,l) cycle
+    if (tid == 0) {
+        int i = k_, j = l_;
+        do {
+            int idx = IDX2C(i, j, n);
+            X[idx] = 1 - X[idx];
+            int j_next = (R[i] < n) ? R[i] : j;
+            int i_next = (Q[j] < n) ? Q[j] : i;
+            i = i_next;
+            j = j_next;
+        } while (!(i == k_ && j == l_));
+    }
+}
+
+bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d_B, int* d_R, int* d_Q, int* k, int* l,int* d_col_to_row, int* d_indices, int* d_row_start, int* d_row_count, int* d_counter, int* d_row_visited, int* d_next_i, int* d_next_j, int* d_parity, int* d_fR, int* d_fQ, unsigned char* d_hasPredR, unsigned char* d_hasPredQ, unsigned char* d_cycR, unsigned char* d_cycQ) {
     dim3 threads(16, 16);
     dim3 blocks((n + threads.x - 1) / threads.x, (n + threads.y - 1) / threads.y);
     compute_col_to_row<<<blocks, threads>>>(n, d_X, d_col_to_row);
@@ -827,6 +1019,39 @@ bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d
     cudaMemcpyFromSymbol(&h_flag, d_flag, sizeof(int), 0, cudaMemcpyDeviceToHost);
 
     if (h_flag == 1) {
+
+        dim3 blockDim(16, 16);
+        dim3 gridDim((n + 15) / 16, (n + 15) / 16);
+
+        // init_mapping<<<gridDim, blockDim>>>(d_R, d_Q, d_next_i, d_next_j, d_parity, n);
+        // pointer_jump_cycle<<<gridDim, blockDim>>>(d_next_i, d_next_j, d_parity, n);
+        // update_dX<<<gridDim, blockDim>>>(d_next_i, d_next_j, d_parity, d_X, n);
+
+        
+        // printf("here\n");
+        // printDeviceMatrix("d_B", d_B, n);
+        // printDeviceMatrix("d_X", d_X, n);
+
+        // printDeviceVector("d_V", d_V, n);
+
+        // printDeviceVector("d_R", d_R, n);
+        // printDeviceVector("d_Q", d_Q, n);
+
+        // printDeviceScalar("k", k);
+        // printDeviceScalar("l", l);
+
+        // printDeviceMatrix("d_X before", d_X, n);
+        // identify_and_flip_singleblock<<<1, 256>>>(d_R, d_Q, d_X, n, k, l,
+        //                                       d_fR, d_fQ,
+        //                                       d_hasPredR, d_hasPredQ,
+        //                                       d_cycR, d_cycQ);
+
+        // cudaDeviceSynchronize();
+        // update_V<<<1,1>>>(d_B, d_V, d_X, d_R, d_Q, n, k, l);
+        // printDeviceMatrix("d_X after", d_X, n);
+
+        // printDeviceMatrix("d_X and then", d_X, n);
+        
         process_cycle<<<1,1>>>(d_B, d_V, d_X, d_R, d_Q, n, k, l);
         
         find_most_negative<<<blocks, threads>>>(d_B, n, k, l);
@@ -878,6 +1103,12 @@ void solve(float* d_C, int* d_X, float* d_U, float* d_V, int n) {
     cudaMalloc(&d_row_start, n*sizeof(int));
     cudaMalloc(&d_row_count, n*sizeof(int));
     cudaMalloc(&d_counter, sizeof(int));
+
+    int *d_next_i, *d_next_j, *d_parity;
+
+    cudaMalloc(&d_next_i, n*sizeof(int));
+    cudaMalloc(&d_next_j, n*sizeof(int));
+    cudaMalloc(&d_parity, n*sizeof(int));
     
 
     // weird
@@ -901,6 +1132,19 @@ void solve(float* d_C, int* d_X, float* d_U, float* d_V, int n) {
     set_array_value<<<(n + 255)/256, 256>>>(d_R, n, n);
     set_array_value<<<(n + 255)/256, 256>>>(d_Q, n, n);
 
+    int *d_fR, *d_fQ;
+    // unsigned char *d_cycR, *d_cycQ;
+    unsigned char *d_hasPredR, *d_hasPredQ, *d_cycR, *d_cycQ;
+
+    cudaMalloc(&d_fR, n*sizeof(int));
+    cudaMalloc(&d_fQ, n*sizeof(int));
+    cudaMalloc(&d_hasPredR, n);
+    cudaMalloc(&d_hasPredQ, n);
+    cudaMalloc(&d_cycR, n);
+    cudaMalloc(&d_cycQ, n);
+
+    // int repR, repQ;
+
     int* d_row_visited;
     cudaMalloc(&d_row_visited, n * sizeof(int));
     set_array_value<<<(n + 255)/256, 256>>>(d_row_visited, 0, n);
@@ -909,7 +1153,7 @@ void solve(float* d_C, int* d_X, float* d_U, float* d_V, int n) {
     int steps = 0;
     while (true) {
         // std::cout << "Step " << steps << " \n";
-        bool should_continue = solve_from_kl(d_C, d_X, d_U, d_V, n, d_B, d_R, d_Q, k, l, d_col_to_row, d_indices, d_row_start, d_row_count, d_counter, d_row_visited);
+        bool should_continue = solve_from_kl(d_C, d_X, d_U, d_V, n, d_B, d_R, d_Q, k, l, d_col_to_row, d_indices, d_row_start, d_row_count, d_counter, d_row_visited,  d_next_i, d_next_j, d_parity, d_fR, d_fQ, d_hasPredR, d_hasPredQ, d_cycR, d_cycQ);
         steps++;
         if (!should_continue) {
             // std::cout << "Solver has converged after " << steps << " steps.\n";
@@ -934,6 +1178,14 @@ void solve(float* d_C, int* d_X, float* d_U, float* d_V, int n) {
     // cudaFree(d_queue);
     // cudaFree(d_q_head);
     // cudaFree(d_q_tail);
+
+    cudaFree(d_next_i);
+    cudaFree(d_next_j);
+    cudaFree(d_parity);
+
+    cudaFree(d_fR); cudaFree(d_fQ);
+    cudaFree(d_hasPredR); cudaFree(d_hasPredQ);
+    cudaFree(d_cycR); cudaFree(d_cycQ);
 }
 
 
