@@ -81,20 +81,10 @@ __device__  int d_b_kl_neg;
 //     if (idx < n) arr[idx] = value;
 // }
 
-__global__ void update_duals(int* R, int* Q, float* U, float* V, int n) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        if (R[i] != n) U[i] += d_epsilon;
-        if (Q[i] != n) V[i] -= d_epsilon;
-    }
-}
+
 
 __device__ inline void atomicMinFloatNonNeg(float* addr, float val) {
     atomicMin(reinterpret_cast<unsigned int*>(addr), __float_as_uint(val));
-}
-
-__global__ void init_minval() {
-    d_min = CUDART_INF_F;
 }
 
 __device__ float atomicMinFloat(float* addr, float value) {
@@ -199,25 +189,9 @@ __global__ void update_Q(int* d_Q, const int* k, const int* l) {
 }
 
 
-__global__ void check_Rk(const int* d_R, const int* k, const int* l, int n) {
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        int Rk = d_R[*k];
-        d_flag = (Rk != n && Rk != *l);
-    }
-}
 
-__global__ void check_bkl(const float* d_B, const int* k, const int* l, int n) {
-    if (threadIdx.x == 0 && blockIdx.x == 0) {
-        int row = *k;
-        int col = *l;
-        float b_kl = d_B[IDX2C(row, col, n)];
-        d_b_kl_neg = (b_kl < 0.0f);
-    }
-}
 
-__global__ void reset_d_found() {
-    if (threadIdx.x == 0 && blockIdx.x == 0) d_found = 0;
-}
+
 
 
 __global__ void compute_col_to_row(int n, const int* X, int* col_to_row) {
@@ -343,7 +317,7 @@ __global__ void solve_1bc_sparse_single_block(
 //     d_R[d_col_to_row[*l]] = *l;
 // }
 
-__global__ void step_2_init(int* d_R, int* d_Q, const int* k, const int* l, int* d_col_to_row, int* d_count) {
+__global__ void step_1_init(int* d_R, int* d_Q, const int* k, const int* l, int* d_col_to_row, int* d_count) {
     d_changed = 0;
     // d_count = 0;
     d_Q[*l] = *k;
@@ -354,6 +328,28 @@ __global__ void compute_B(const float* C, const float* U, const float* V, float*
     int i = blockIdx.y * blockDim.y + threadIdx.y;
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n && j < n) B[IDX2C(i, j, n)] = C[IDX2C(i, j, n)] - U[i] - V[j];
+}
+
+__global__ void update_duals(int* R, int* Q, float* U, float* V, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        if (R[i] != n) U[i] += d_epsilon;
+        if (Q[i] != n) V[i] -= d_epsilon;
+    }
+}
+
+__global__ void update_duals_and_compute_B(int* R, int* Q, float* U, float* V, const float* C, float* B, int n) {
+    // int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int idx = IDX2C(i, j, n);
+    if (idx < n) {
+        if (R[idx] != n) U[idx] += d_epsilon;
+        if (Q[idx] != n) V[idx] -= d_epsilon;
+    }
+    __syncthreads();
+    __threadfence_system();
+    if (i < n && j < n) B[idx] = C[idx] - U[i] - V[j];
 }
 
 __global__ void reset_RQ(int* R, int* Q, int n) {
@@ -409,75 +405,9 @@ __global__ void reset_RQ(int* R, int* Q, int n) {
 //     }
 // }
 
-// __global__ void compute_B_and_find_most_negative_and_reset_RQ(const float* C, const float* U, const float* V, float* __restrict__ d_B, int n, int* d_out_i, int* d_out_j, int* R, int* Q) {
-//     int row = blockIdx.y * blockDim.y + threadIdx.y;
-//     int col = blockIdx.x * blockDim.x + threadIdx.x;
-//     int tid = threadIdx.y * blockDim.x + threadIdx.x;
-//     int threads_per_block = blockDim.x * blockDim.y;
-//     extern __shared__ float s_vals[];
-//     __shared__ int s_rows[256];
-//     __shared__ int s_cols[256];
-//     float val = INFINITY;
-//     int myRow = -1, myCol = -1;
-//     int idx = IDX2C(row, col, n);
-//     if (row < n && col < n) {
-//         // B[IDX2C(i, j, n)] = C[IDX2C(i, j, n)] - U[i] - V[j];
-//         float tmp = C[idx] - U[row] - V[col];
-//         if (tmp < 0.0f) {
-//             val = tmp;
-//             myRow = row;
-//             myCol = col;
-//         }
-//         d_B[idx] = tmp;
-//         if (idx < n) {
-//             R[idx] = n;
-//             Q[idx] = n;
-//         }
-//     }
-//     s_vals[tid] = val;
-//     s_rows[tid] = myRow;
-//     s_cols[tid] = myCol;
-//     __syncthreads();
-//     for (int stride = threads_per_block >> 1; stride > 0; stride >>= 1) {
-//         if (tid < stride) {
-//             if (s_vals[tid + stride] < s_vals[tid]) {
-//                 s_vals[tid] = s_vals[tid + stride];
-//                 s_rows[tid] = s_rows[tid + stride];
-//                 s_cols[tid] = s_cols[tid + stride];
-//             }
-//         }
-//         __syncthreads();
-//     }
-//     if (tid == 0 && s_vals[0] < INFINITY) {
-//         d_found = 1;
-//         float oldMin = atomicMinFloat(&d_min, s_vals[0]);
-//         if (s_vals[0] < oldMin) {
-//             *d_out_i = s_rows[0];
-//             *d_out_j = s_cols[0];
-//         }
-//     }
-// }
-
-
-__global__ void step_3a(const float* C, const float* U, float* V, float* __restrict__ d_B, int n, int* d_out_i, int* d_out_j, int* R, int* Q, int* d_X, int* k, int* l) {
+__global__ void compute_B_and_find_most_negative_and_reset_RQ(const float* C, const float* U, const float* V, float* __restrict__ d_B, int n, int* d_out_i, int* d_out_j, int* R, int* Q) {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (row == 0 && col == 0) {
-        int k_ = *k;
-        int l_ = *l;
-        while (true) {
-            d_X[IDX2C(k_, l_, n)] = 1;
-            l_ = R[k_];
-            d_X[IDX2C(k_, l_, n)] = 0;
-            k_ = Q[l_];
-            if (k_ == *k && l_ == *l) break;
-        }
-        V[*l] += d_B[IDX2C(*k, *l, n)];
-    } 
-    __syncthreads();
-    __threadfence_system();
-
     int tid = threadIdx.y * blockDim.x + threadIdx.x;
     int threads_per_block = blockDim.x * blockDim.y;
     extern __shared__ float s_vals[];
@@ -525,6 +455,247 @@ __global__ void step_3a(const float* C, const float* U, float* V, float* __restr
 }
 
 
+// __global__ void step_2(const float* C, const float* U, float* V, float* __restrict__ d_B, int n, int* d_out_i, int* d_out_j, int* R, int* Q, int* d_X, int* k, int* l) {
+//     int row = blockIdx.y * blockDim.y + threadIdx.y;
+//     int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+//     if (row == 0 && col == 0) {
+//         int k_ = *k;
+//         int l_ = *l;
+//         while (true) {
+//             d_X[IDX2C(k_, l_, n)] = 1;
+//             l_ = R[k_];
+//             d_X[IDX2C(k_, l_, n)] = 0;
+//             k_ = Q[l_];
+//             if (k_ == *k && l_ == *l) break;
+//         }
+//         V[*l] += d_B[IDX2C(*k, *l, n)];
+//     } 
+//     __syncthreads();
+//     __threadfence_system();
+
+//     int tid = threadIdx.y * blockDim.x + threadIdx.x;
+//     int threads_per_block = blockDim.x * blockDim.y;
+//     extern __shared__ float s_vals[];
+//     __shared__ int s_rows[256];
+//     __shared__ int s_cols[256];
+//     float val = INFINITY;
+//     int myRow = -1, myCol = -1;
+//     int idx = IDX2C(row, col, n);
+//     if (row < n && col < n) {
+//         // B[IDX2C(i, j, n)] = C[IDX2C(i, j, n)] - U[i] - V[j];
+//         float tmp = C[idx] - U[row] - V[col];
+//         if (tmp < 0.0f) {
+//             val = tmp;
+//             myRow = row;
+//             myCol = col;
+//         }
+//         d_B[idx] = tmp;
+//         if (idx < n) {
+//             R[idx] = n;
+//             Q[idx] = n;
+//         }
+//     }
+//     s_vals[tid] = val;
+//     s_rows[tid] = myRow;
+//     s_cols[tid] = myCol;
+//     __syncthreads();
+//     for (int stride = threads_per_block >> 1; stride > 0; stride >>= 1) {
+//         if (tid < stride) {
+//             if (s_vals[tid + stride] < s_vals[tid]) {
+//                 s_vals[tid] = s_vals[tid + stride];
+//                 s_rows[tid] = s_rows[tid + stride];
+//                 s_cols[tid] = s_cols[tid + stride];
+//             }
+//         }
+//         __syncthreads();
+//     }
+//     if (tid == 0 && s_vals[0] < INFINITY) {
+//         d_found = 1;
+//         float oldMin = atomicMinFloat(&d_min, s_vals[0]);
+//         if (s_vals[0] < oldMin) {
+//             *d_out_i = s_rows[0];
+//             *d_out_j = s_cols[0];
+//         }
+//     }
+// }
+
+// __global__ void step_2_plus(const float* C, const float* U, float* V, float* __restrict__ d_B, int n, int* d_out_i, int* d_out_j, int* R, int* Q, int* d_X, int* k, int* l) {
+//     int row = blockIdx.y * blockDim.y + threadIdx.y;
+//     int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+//     d_flag = (R[*k] != n && R[*k] != *l);
+//     if (!d_flag) return;
+
+//     if (row == 0 && col == 0) {
+//         int k_ = *k;
+//         int l_ = *l;
+//         while (true) {
+//             d_X[IDX2C(k_, l_, n)] = 1;
+//             l_ = R[k_];
+//             d_X[IDX2C(k_, l_, n)] = 0;
+//             k_ = Q[l_];
+//             if (k_ == *k && l_ == *l) break;
+//         }
+//         V[*l] += d_B[IDX2C(*k, *l, n)];
+//     } 
+//     __syncthreads();
+//     __threadfence_system();
+
+//     int tid = threadIdx.y * blockDim.x + threadIdx.x;
+//     int threads_per_block = blockDim.x * blockDim.y;
+//     extern __shared__ float s_vals[];
+//     __shared__ int s_rows[256];
+//     __shared__ int s_cols[256];
+//     float val = INFINITY;
+//     int myRow = -1, myCol = -1;
+//     int idx = IDX2C(row, col, n);
+//     if (row < n && col < n) {
+//         // B[IDX2C(i, j, n)] = C[IDX2C(i, j, n)] - U[i] - V[j];
+//         float tmp = C[idx] - U[row] - V[col];
+//         if (tmp < 0.0f) {
+//             val = tmp;
+//             myRow = row;
+//             myCol = col;
+//         }
+//         d_B[idx] = tmp;
+//         if (idx < n) {
+//             R[idx] = n;
+//             Q[idx] = n;
+//         }
+//     }
+//     s_vals[tid] = val;
+//     s_rows[tid] = myRow;
+//     s_cols[tid] = myCol;
+//     __syncthreads();
+//     for (int stride = threads_per_block >> 1; stride > 0; stride >>= 1) {
+//         if (tid < stride) {
+//             if (s_vals[tid + stride] < s_vals[tid]) {
+//                 s_vals[tid] = s_vals[tid + stride];
+//                 s_rows[tid] = s_rows[tid + stride];
+//                 s_cols[tid] = s_cols[tid + stride];
+//             }
+//         }
+//         __syncthreads();
+//     }
+//     if (tid == 0 && s_vals[0] < INFINITY) {
+//         d_found = 1;
+//         float oldMin = atomicMinFloat(&d_min, s_vals[0]);
+//         if (s_vals[0] < oldMin) {
+//             *d_out_i = s_rows[0];
+//             *d_out_j = s_cols[0];
+//         }
+//     }
+// }
+
+// __global__ void check_Rk(const int* d_R, const int* k, const int* l, int n) {
+//     if (threadIdx.x == 0 && blockIdx.x == 0) {
+//         int Rk = d_R[*k];
+//         d_flag = (Rk != n && Rk != *l);
+//     }
+// }
+
+// __global__ void init_minval() {
+//     d_min = CUDART_INF_F;
+// }
+
+__global__ void step_2_or_3(int* d_X, const int* R, const int* Q, const int* k, const int* l, int n, float* V, float* __restrict__ d_B) {
+    // if (threadIdx.x == 0 && blockIdx.x == 0) {
+    int Rk = R[*k];
+    d_flag = (Rk != n && Rk != *l);
+    // }
+
+    if (d_flag){
+        int k_ = *k;
+        int l_ = *l;
+        while (true) {
+            d_X[IDX2C(k_, l_, n)] = 1;
+            l_ = R[k_];
+            d_X[IDX2C(k_, l_, n)] = 0;
+            k_ = Q[l_];
+            if (k_ == *k && l_ == *l) break;
+        }
+        V[*l] += d_B[IDX2C(*k, *l, n)];
+    } else {
+        d_min = CUDART_INF_F;
+    }
+}
+
+__global__ void check_bkl(const float* d_B, const int* k, const int* l, int n) {
+    // if (threadIdx.x == 0 && blockIdx.x == 0) {
+    int row = *k;
+    int col = *l;
+    float b_kl = d_B[IDX2C(row, col, n)];
+    d_b_kl_neg = (b_kl < 0.0f);
+    // }
+}
+
+__global__ void reset_d_found() {
+    if (threadIdx.x == 0 && blockIdx.x == 0) d_found = 0;
+}
+
+__global__ void check_bkl_or_reset_d_found(const float* d_B, const int* k, const int* l, int n) {
+    // if (threadIdx.x == 0 && blockIdx.x == 0) {
+    int row = *k;
+    int col = *l;
+    float b_kl = d_B[IDX2C(row, col, n)];
+    d_b_kl_neg = (b_kl < 0.0f);
+
+    if (d_b_kl_neg != 1) {
+        d_found = 0;
+    }
+    // }
+}
+
+
+// __global__ void find_most_negative_and_reset_RQ(const float* __restrict__ d_B, int n, int* d_out_i, int* d_out_j, int* R, int* Q) {
+//     int row = blockIdx.y * blockDim.y + threadIdx.y;
+//     int col = blockIdx.x * blockDim.x + threadIdx.x;
+//     int tid = threadIdx.y * blockDim.x + threadIdx.x;
+//     int threads_per_block = blockDim.x * blockDim.y;
+//     extern __shared__ float s_vals[];
+//     __shared__ int s_rows[256];
+//     __shared__ int s_cols[256];
+//     float val = INFINITY;
+//     int myRow = -1, myCol = -1;
+//     if (row < n && col < n) {
+//         int idx = IDX2C(row, col, n);
+//         float tmp = d_B[idx];
+//         if (tmp < 0.0f) {
+//             val = tmp;
+//             myRow = row;
+//             myCol = col;
+//         }
+//         if (idx < n) {
+//             R[idx] = n;
+//             Q[idx] = n;
+//         }
+//     }
+//     s_vals[tid] = val;
+//     s_rows[tid] = myRow;
+//     s_cols[tid] = myCol;
+//     __syncthreads();
+//     for (int stride = threads_per_block >> 1; stride > 0; stride >>= 1) {
+//         if (tid < stride) {
+//             if (s_vals[tid + stride] < s_vals[tid]) {
+//                 s_vals[tid] = s_vals[tid + stride];
+//                 s_rows[tid] = s_rows[tid + stride];
+//                 s_cols[tid] = s_cols[tid + stride];
+//             }
+//         }
+//         __syncthreads();
+//     }
+//     if (tid == 0 && s_vals[0] < INFINITY) {
+//         d_found = 1;
+//         float oldMin = atomicMinFloat(&d_min, s_vals[0]);
+//         if (s_vals[0] < oldMin) {
+//             *d_out_i = s_rows[0];
+//             *d_out_j = s_cols[0];
+//         }
+//     }
+// }
+
+
 bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d_B, int* d_R, int* d_Q, int* k, int* l,int* d_col_to_row, int* d_indices, int* d_count) {
     dim3 threads(16, 16);
     dim3 blocks((n + threads.x - 1) / threads.x, (n + threads.y - 1) / threads.y);
@@ -532,7 +703,7 @@ bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d
     
     compute_col_to_row<<<blocks, threads>>>(n, d_X, d_col_to_row);
     // update_Q<<<1,1>>>(d_Q, k, l);
-    step_2_init<<<1,1>>>(d_R, d_Q, k, l, d_col_to_row, d_count);
+    step_1_init<<<1,1>>>(d_R, d_Q, k, l, d_col_to_row, d_count);
     // reset_d_changed<<<1,1>>>();   
        
     
@@ -569,9 +740,10 @@ bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d
     cudaDeviceSynchronize();
 
 
-    check_Rk<<<1,1>>>(d_R, k, l, n);
+    // check_Rk<<<1,1>>>(d_R, k, l, n);
+    step_2_or_3<<<1,1>>>(d_X, d_R, d_Q, k, l, n, d_V, d_B);
 
-   
+    // step_2_plus<<<blocks, threads>>>(d_C, d_U, d_V, d_B, n, k, l, d_R, d_Q, d_X, k, l);
 
     int h_flag;
     cudaMemcpyFromSymbol(&h_flag, d_flag, sizeof(int), 0, cudaMemcpyDeviceToHost);
@@ -587,27 +759,31 @@ bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d
         // set_array_value<<<(n + 255)/256, 256>>>(d_Q, n, n);
         // compute_B_and_find_most_negative<<<blocks, threads>>>(d_C, d_U, d_V, d_B, n, k, l);
         // reset_RQ<<<(n + 255)/256, 256>>>(d_R, d_Q, n);
-        // compute_B_and_find_most_negative_and_reset_RQ<<<blocks, threads>>>(d_C, d_U, d_V, d_B, n, k, l, d_R, d_Q);
-        step_3a<<<blocks, threads>>>(d_C, d_U, d_V, d_B, n, k, l, d_R, d_Q, d_X, k, l);
+        compute_B_and_find_most_negative_and_reset_RQ<<<blocks, threads>>>(d_C, d_U, d_V, d_B, n, k, l, d_R, d_Q);
+        // step_2<<<blocks, threads>>>(d_C, d_U, d_V, d_B, n, k, l, d_R, d_Q, d_X, k, l);
         return true;
     }
-    init_minval<<<1, 1>>>();
+    // init_minval<<<1, 1>>>();
     
     find_min_valid_atomic2d<<<blocks, threads>>>(d_B, d_R, d_Q, n);
     finalize_epsilon<<<1, 1>>>(d_B, n, k, l);
     update_duals<<<(n + 255) / 256, 256>>>(d_R, d_Q, d_U, d_V, n);
     compute_B<<<blocks, threads>>>(d_C, d_U, d_V, d_B, n);
+
+    // update_duals_and_compute_B<<<blocks, threads>>>(d_R, d_Q, d_U, d_V, d_C, d_B, n);
     
-    check_bkl<<<1,1>>>(d_B, k, l, n);
+    // check_bkl<<<1,1>>>(d_B, k, l, n);
+    check_bkl_or_reset_d_found<<<1,1>>>(d_B, k, l, n);
     
 
     int h_b_kl_neg;
     cudaMemcpyFromSymbol(&h_b_kl_neg, d_b_kl_neg, sizeof(int), 0, cudaMemcpyDeviceToHost);
 
     if (h_b_kl_neg == 1) return true;
-    reset_d_found<<<1,1>>>();
+    // reset_d_found<<<1,1>>>();
     
     find_most_negative<<<blocks, threads>>>(d_B, n, k, l);
+    // find_most_negative_and_reset_RQ<<<blocks, threads>>>(d_B, n, k, l, d_R, d_Q);
 
     int h_found;
     cudaMemcpyFromSymbol(&h_found, d_found, sizeof(int), 0, cudaMemcpyDeviceToHost);
