@@ -1294,42 +1294,443 @@ __global__ void identify_and_flip_singleblock(const int* R, const int* Q,
 //     }
 // }
 
+// __global__ void solve_1bc_persistent(
+//     int n, const int* d_col_to_row, int* k, int* l,
+//     const float* B, int* R, int* Q)
+// {
+//     __shared__ int block_changed;
+
+//     // Create cooperative grid group
+//     cg::grid_group grid = cg::this_grid();
+
+//     while (true) {
+//         // Step 1: reset block-local flag
+//         if (threadIdx.x == 0 && threadIdx.y == 0)
+//             block_changed = 0;
+//         __syncthreads();
+
+//         // Step 2: iterate over all rows/cols with grid-stride loops
+//         for (int i = blockIdx.y * blockDim.y + threadIdx.y;
+//              i < n;
+//              i += gridDim.y * blockDim.y)
+//         {
+//             for (int j = blockIdx.x * blockDim.x + threadIdx.x;
+//                  j < n;
+//                  j += gridDim.x * blockDim.x)
+//             {
+
+//                 if (i != *k && R[i] != n && Q[j] == n) {
+//                     float b_val = B[IDX2C(i, j, n)];
+//                     if (b_val == 0.0f) {
+//                         if (atomicMin(&Q[j], i) == n){
+//                             block_changed = 1;
+//                             R[d_col_to_row[j]] = j;
+//                         }
+//                     }
+//                 }
+//             }
+//         }
+
+//         __syncthreads();
+
+//         // Step 3: reduce to a single global flag
+//         if (threadIdx.x == 0 && threadIdx.y == 0 && block_changed)
+//             atomicExch(&d_changed, 1);
+
+//         // Step 4: global sync — wait for all blocks
+//         grid.sync();
+
+//         // Step 5: one thread decides whether to continue
+//         if (grid.thread_rank() == 0) {
+//             if (d_changed == 0) {
+//                 d_changed = -1;  // signal exit
+//             } else {
+//                 d_changed = 0;   // reset for next iteration
+//             }
+//         }
+
+//         grid.sync();
+
+//         // Step 6: exit condition
+//         if (d_changed == -1)
+//             break;
+//     }
+// }
+
+// __global__ void solve_1bc_persistent(
+//     int n, const int* d_col_to_row, int* k, int* l,
+//     const float* B, int* R, int* Q)
+// {
+//     __shared__ int block_changed;
+//     cg::grid_group grid = cg::this_grid();
+
+//     // per-row flags for newly labeled rows
+//     extern __shared__ int newly_labeled[];  // size ≥ n; clear at launch if reused
+
+//     while (true) {
+//         if (threadIdx.x == 0)
+//             block_changed = 0;
+//         __syncthreads();
+
+//         // -----------------------------------------------------
+//         // Stage 1: find rows that are currently labeled
+//         // -----------------------------------------------------
+//         for (int i = blockIdx.x * blockDim.x + threadIdx.x;
+//              i < n; i += gridDim.x * blockDim.x)
+//             newly_labeled[i] = (R[i] != n && i != *k) ? 1 : 0;
+
+//         grid.sync();
+
+//         // -----------------------------------------------------
+//         // Stage 2: process all columns of these labeled rows
+//         // -----------------------------------------------------
+//         const int total_threads = gridDim.x * blockDim.x;
+//         const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+//         for (int t = tid; t < (long long)n * n; t += total_threads) {
+//             int i = t / n;
+//             int j = t % n;
+//             if (!newly_labeled[i]) continue;
+
+//             if (i != *k && R[i] != n && Q[j] == n) {
+//                 float b_val = B[IDX2C(i, j, n)];
+//                 if (b_val == 0.0f) {
+//                     if (atomicMin(&Q[j], i) == n) {
+//                         block_changed = 1;
+//                         R[d_col_to_row[j]] = j;       // new row labeled
+//                     }
+//                 }
+//             }
+//         }
+
+//         __syncthreads();
+
+//         // -----------------------------------------------------
+//         // Stage 3: propagate global change flag
+//         // -----------------------------------------------------
+//         if (threadIdx.x == 0 && block_changed)
+//             atomicExch(&d_changed, 1);
+
+//         grid.sync();
+
+//         // -----------------------------------------------------
+//         // Stage 4: decide whether to continue
+//         // -----------------------------------------------------
+//         if (grid.thread_rank() == 0) {
+//             d_changed = (d_changed == 0) ? -1 : 0;
+//         }
+
+//         grid.sync();
+//         if (d_changed == -1)
+//             break;
+//     }
+// }
+
+// __device__ int  d_active_count;   // number of active rows
+// __device__ int  d_next_count;     // number of next rows
+// __device__ int* d_active_rows;    // array of active row indices (len ≥ n)
+// __device__ int* d_next_rows;      // array of next row indices (len ≥ n)
+
+// ------------------------------------------------------------
+// Persistent kernel (1D grid) — active-row labeling
+// ------------------------------------------------------------
+// __global__ void solve_1bc_persistent(
+//     int n, const int* d_col_to_row, int* k, int* l,
+//     const float* B, int* R, int* Q)
+// {
+//     __shared__ int block_changed;
+//     cg::grid_group grid = cg::this_grid();
+
+//     // ============================================================
+//     // Step 0: Initialize active rows ONCE (first launch)
+//     // ============================================================
+//     // grid.sync();
+//     // if (grid.thread_rank() == 0 ) {
+//         // d_active_rows[0] = *k;   // start from row *k
+//         int row_k = *k;           // get initial row index from device pointer
+// d_active_rows[0] = row_k; // seed the first active row
+
+//         d_active_count   = 1;
+//         d_next_count     = 0;
+//         d_changed        = 0;
+//     // }
+//     // grid.sync();
+
+//     printf("Before %d\n", d_active_count);
+
+
+//     // ============================================================
+//     // Main persistent loop
+//     // ============================================================
+//     while (true) {
+//         // Step 1: reset per-block flag
+//         if (threadIdx.x == 0) block_changed = 0;
+//         __syncthreads();
+
+//         // Step 2: clear global change flag at start of each round
+//         if (grid.thread_rank() == 0)
+//             d_changed = 0;
+//         grid.sync();
+
+//         // Step 3: reload active size
+//         int active = d_active_count;
+
+
+//         if (active == 0) {
+//             if (grid.thread_rank() == 0)
+//                 d_changed = -1;  // no more active rows → stop
+//             grid.sync();
+//             if (d_changed == -1)
+//                 break;
+//             continue;
+//         }
+
+//         // Step 4: process (active_rows × all columns)
+//         const long long total_threads = 1LL * gridDim.x * blockDim.x;
+//         const long long tid = 1LL * blockIdx.x * blockDim.x + threadIdx.x;
+//         const long long total = 1LL * active * n;
+//         const int row_k = *k;
+
+//         if (d_active_count != 0)printf("Before active %d, total_threads %d\n, tid %d, block_changed %d\n", active, total_threads, tid, block_changed);
+//         for (long long t = tid; t < total; t += total_threads) {
+//             int ar = (int)(t / n);
+//             int j  = (int)(t % n);
+//             int i  = d_active_rows[ar];
+
+//             if (i == row_k || R[i] == n || Q[j] != n)
+//                 continue;
+
+//             float b = B[IDX2C(i, j, n)];
+
+//             printf("i %d, j %d\n, b %d\n", i, j, b);
+
+//             if (b == 0.0f) {
+//                 if (atomicMin(&Q[j], i) == n) {
+//                     int rj = d_col_to_row[j];
+//                     if (atomicCAS(&R[rj], n, j) == n) {
+//                         int pos = atomicAdd(&d_next_count, 1);
+//                         d_next_rows[pos] = rj;
+//                         block_changed = 1;
+//                     }
+//                 }
+//             }
+//         }
+
+//         __syncthreads();
+
+//         // Step 5: block → global change flag
+//         if (threadIdx.x == 0 && block_changed)
+//             atomicExch(&d_changed, 1);
+
+//         // Step 6: global sync and decision
+//         grid.sync();
+
+//         if (grid.thread_rank() == 0) {
+//             if (d_changed == 0) {
+//                 d_changed = -1;  // no change → stop
+//             } else {
+//                 // swap active ↔ next
+//                 int* tmp_ptr = d_active_rows;  d_active_rows = d_next_rows;  d_next_rows = tmp_ptr;
+//                 d_active_count = d_next_count;
+//                 d_next_count = 0;
+//                 d_changed = 0;   // reset flag for next round
+//             }
+//         }
+
+//         grid.sync();
+//         if (d_changed == -1)
+//             break;
+//     }
+// }
+// __global__ void solve_1bc_persistent(
+//     int n, const int* d_col_to_row, int* k, int* l,
+//     const float* B, int* R, int* Q)
+// {
+//     __shared__ int block_changed;
+//     cg::grid_group grid = cg::this_grid();
+
+//     while (true) {
+//         // printf("here?????????");
+//         // Step 1: reset only the *block* flag (like the original)
+//         if (threadIdx.x == 0) block_changed = 0;
+//         __syncthreads();
+
+//         // ----------------------------
+//         // Step 2: do the work
+//         // ----------------------------
+//         int active = d_active_count;   // current active set size
+//         const long long nt  = 1LL * gridDim.x * blockDim.x;
+//         const long long tid = 1LL * blockIdx.x * blockDim.x + threadIdx.x;
+//         const int row_k     = *k;
+
+//         // printf("Before active %d, nt %d\n, tid %d, block_changed %d\n", active, nt, tid, block_changed);
+
+//         if (active > 0) {
+//             const long long total = 1LL * active * n;
+
+//             for (long long t = tid; t < total; t += nt) {
+//                 int ar = (int)(t / n);
+//                 int j  = (int)(t - 1LL * ar * n);
+//                 int i  = d_active_rows[ar];
+
+//                 // Fast filters
+//                 if (i == row_k)   continue;
+//                 if (R[i] == n)    continue;   // safety
+//                 if (Q[j] != n)    continue;
+
+
+//                 float b = B[IDX2C(i, j, n)];
+
+//                 printf("i %d, j %d\n, b %d\n", i, j, b);
+
+//                 if (b == 0.0f) {
+//                     if (atomicMin(&Q[j], i) == n) {
+//                         int rj = d_col_to_row[j];
+//                         // label the row once, and enqueue it for next iteration
+//                         if (atomicCAS(&R[rj], n, j) == n) {
+//                             int pos = atomicAdd(&d_next_count, 1);
+//                             d_next_rows[pos] = rj;
+//                             block_changed = 1;
+//                         }
+//                     }
+//                 }
+//             }
+//         }
+
+//         __syncthreads();
+
+//         // printf("After active %d, nt %d\n, tid %d, block_changed %d\n", active, nt, tid, block_changed);
+
+//         // Step 3: per-block -> global changed flag (exactly like original)
+//         if (threadIdx.x == 0 && block_changed)
+//             atomicExch(&d_changed, 1);
+
+//         // Step 4: global sync — wait for all blocks
+//         grid.sync();
+
+//         // Step 5: one thread decides whether to continue (original logic)
+//         if (grid.thread_rank() == 0) {
+//             if (d_changed == 0) {
+//                 // no block reported change this round -> exit
+//                 d_changed = -1;
+//             } else {
+//                 // progress happened -> reset flag and rotate lists
+//                 d_changed = 0;
+
+//                 // swap active and next
+//                 int* tmp_ptr = d_active_rows;  d_active_rows = d_next_rows;  d_next_rows = tmp_ptr;
+//                 int  tmp_cnt = d_active_count; d_active_count = d_next_count; d_next_count = tmp_cnt;
+
+//                 // clear next_count for the following round
+//                 d_next_count = 0;
+//             }
+//         }
+
+//         // Step 6: global sync
+//         grid.sync();
+
+//         // Step 7: exit condition
+//         if (d_changed == -1) break;
+//     }
+// }
+
+
+__device__ int  d_active_count;   // number of active rows
+__device__ int  d_next_count;     // number of next rows
+
+// -------------------------------------------------------------------
+// Kernel: 1D active-row labeling, cooperative persistent grid
+// -------------------------------------------------------------------
 __global__ void solve_1bc_persistent(
-    int n, const int* X, int* k, int* l,
-    const float* B, int* R, int* Q)
+    int n,
+    const int* __restrict__ d_col_to_row,
+    int* __restrict__ k,
+    int* __restrict__ l,
+    const float* __restrict__ B,
+    int* __restrict__ R,
+    int* __restrict__ Q,
+    int* __restrict__ d_active_rows,
+    int* __restrict__ d_next_rows)
 {
     __shared__ int block_changed;
-
-    // Create cooperative grid group
     cg::grid_group grid = cg::this_grid();
 
+    // Step 0: initialize active rows once
+    // if (grid.thread_rank() == 0) {
+    if (grid.thread_rank() == 0)
+    d_active_count = 0;  // make sure count starts clean
+grid.sync();
+
+// Each thread checks rows in parallel
+for (int i = blockIdx.x * blockDim.x + threadIdx.x;
+     i < n; i += gridDim.x * blockDim.x)
+{
+    if (R[i] != n && i != *k) {
+        int pos = atomicAdd(&d_active_count, 1);
+        d_active_rows[pos] = i;
+    }
+}
+grid.sync();
+
+// Now all initially labeled rows are in active list
+if (grid.thread_rank() == 0) {
+    d_next_count = 0;
+    d_changed = 0;
+}
+// grid.sync();
+    // }
+    // printf("Before %d\n", d_active_count);
+    grid.sync();
+    // printf("Before2 %d\n", d_active_count);
+
     while (true) {
-        // Step 1: reset block-local flag
-        if (threadIdx.x == 0 && threadIdx.y == 0)
+        if (threadIdx.x == 0)
             block_changed = 0;
         __syncthreads();
 
-        // Step 2: iterate over all rows/cols with grid-stride loops
-        for (int i = blockIdx.y * blockDim.y + threadIdx.y;
-             i < n;
-             i += gridDim.y * blockDim.y)
-        {
-            for (int j = blockIdx.x * blockDim.x + threadIdx.x;
-                 j < n;
-                 j += gridDim.x * blockDim.x)
-            {
-                // printf("i %d, j %d\n", i, j);
-                // --- main logic ---
-                if (Q[j] != n && X[IDX2C(i, j, n)] == 1) {
-                    if (atomicCAS(&R[i], n, j) == n)
-                        block_changed = 1;
-                }
+        if (grid.thread_rank() == 0)
+            d_changed = 0;   // reset global flag
+        grid.sync();
 
-                if (i != *k && R[i] != n && Q[j] == n) {
-                    float b_val = B[IDX2C(i, j, n)];
-                    if (b_val == 0.0f) {
-                        if (atomicMin(&Q[j], i) > i)
-                            block_changed = 1;
+        int active = d_active_count;
+        if (active == 0) {
+            if (grid.thread_rank() == 0)
+                d_changed = -1;
+            grid.sync();
+            if (d_changed == -1)
+                break;
+            continue;
+        }
+
+        const long long nt  = 1LL * gridDim.x * blockDim.x;
+        const long long tid = 1LL * blockIdx.x * blockDim.x + threadIdx.x;
+        const long long total = 1LL * active * n;
+        const int row_k = *k;
+
+        // printf("Before active %d, nt %d\n, tid %d, block_changed %d\n", active, nt, tid, block_changed);
+
+
+        for (long long t = tid; t < total; t += nt) {
+            // printf("t %d\n\n", t);
+            int ar = (int)(t / n);
+            int j  = (int)(t % n);
+            int i  = d_active_rows[ar];
+
+            // printf("i %d, j %d\n \n", i, j);
+
+            if (i == row_k || R[i] == n || Q[j] != n)
+                continue;
+
+            float b = B[IDX2C(i, j, n)];
+
+            
+            if (b == 0.0f) {
+                if (atomicMin(&Q[j], i) == n) {
+                    int rj = d_col_to_row[j];
+                    if (atomicCAS(&R[rj], n, j) == n) {
+                        int pos = atomicAdd(&d_next_count, 1);
+                        d_next_rows[pos] = rj;
+                        block_changed = 1;
                     }
                 }
             }
@@ -1337,38 +1738,35 @@ __global__ void solve_1bc_persistent(
 
         __syncthreads();
 
-        // Step 3: reduce to a single global flag
-        if (threadIdx.x == 0 && threadIdx.y == 0 && block_changed)
+        if (threadIdx.x == 0 && block_changed)
             atomicExch(&d_changed, 1);
 
-        // Step 4: global sync — wait for all blocks
         grid.sync();
 
-        // Step 5: one thread decides whether to continue
         if (grid.thread_rank() == 0) {
             if (d_changed == 0) {
-                d_changed = -1;  // signal exit
+                d_changed = -1;  // no change -> stop
             } else {
-                d_changed = 0;   // reset for next iteration
+                // rotate lists
+                int* tmp = d_active_rows;  d_active_rows = d_next_rows;  d_next_rows = tmp;
+                d_active_count = d_next_count;
+                d_next_count = 0;
+                d_changed = 0;
             }
         }
 
         grid.sync();
-
-        // Step 6: exit condition
         if (d_changed == -1)
             break;
     }
 }
 
-
-bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d_B, int* d_R, int* d_Q, int* k, int* l,int* d_col_to_row, int* d_indices, int* d_row_start, int* d_row_count, int* d_counter, int* d_row_visited, int* d_next_i, int* d_next_j, int* d_parity, int* d_fR, int* d_fQ, unsigned char* d_hasPredR, unsigned char* d_hasPredQ, unsigned char* d_cycR, unsigned char* d_cycQ) {
+bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d_B, int* d_R, int* d_Q, int* k, int* l,int* d_col_to_row, int* d_indices, int* d_row_start, int* d_row_count, int* d_counter, int* d_row_visited, int* d_next_i, int* d_next_j, int* d_parity, int* d_fR, int* d_fQ, unsigned char* d_hasPredR, unsigned char* d_hasPredQ, unsigned char* d_cycR, unsigned char* d_cycQ, int* d_active_rows, int* d_next_rows) {
     dim3 threads(16, 16);
     dim3 blocks((n + threads.x - 1) / threads.x, (n + threads.y - 1) / threads.y);
     compute_col_to_row<<<blocks, threads>>>(n, d_X, d_col_to_row);
-    update_Q<<<1,1>>>(d_Q, k, l);
-    // update_RQ<<<1,1>>>(d_R, d_Q, k, l, d_col_to_row);
-
+    // update_Q<<<1,1>>>(d_Q, k, l);
+    update_RQ<<<1,1>>>(d_R, d_Q, k, l, d_col_to_row);
     reset_d_changed<<<1,1>>>();         
 
 
@@ -1413,8 +1811,19 @@ bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d
     // );
 
 
-    void* args[] = { &n, &d_X, &k, &l, &d_B, &d_R, &d_Q };
-    cudaLaunchCooperativeKernel((void*)solve_1bc_persistent,  dim3(22,22),  dim3(16,16), args);
+    // void* args[] = { &n, &d_col_to_row, &k, &l, &d_B, &d_R, &d_Q };
+    // cudaLaunchCooperativeKernel((void*)solve_1bc_persistent,  dim3(22,22),  dim3(16,16), args);
+    // cudaLaunchCooperativeKernel((void*)solve_1bc_persistent,  352,  256, args);
+    void* args[] = {
+        &n, &d_col_to_row, &k, &l,
+        &d_B, &d_R, &d_Q,
+        &d_active_rows, &d_next_rows
+    };
+    cudaLaunchCooperativeKernel(
+        (void*)solve_1bc_persistent,
+        352, 256,
+        args, 0, nullptr);
+
     cudaDeviceSynchronize();
 
     
@@ -1552,6 +1961,10 @@ void solve(float* d_C, int* d_X, float* d_U, float* d_V, int n) {
     // cudaMalloc(&d_q_head, sizeof(int));
     // cudaMalloc(&d_q_tail, sizeof(int));
 
+    int *d_active_rows, *d_next_rows;
+    cudaMalloc(&d_active_rows, n * sizeof(int));
+    cudaMalloc(&d_next_rows,   n * sizeof(int));
+
 
 
     cudaMalloc(&d_B, n * n * sizeof(float));
@@ -1588,7 +2001,7 @@ void solve(float* d_C, int* d_X, float* d_U, float* d_V, int n) {
     int steps = 0;
     while (true) {
         // std::cout << "Step " << steps << " \n";
-        bool should_continue = solve_from_kl(d_C, d_X, d_U, d_V, n, d_B, d_R, d_Q, k, l, d_col_to_row, d_indices, d_row_start, d_row_count, d_counter, d_row_visited,  d_next_i, d_next_j, d_parity, d_fR, d_fQ, d_hasPredR, d_hasPredQ, d_cycR, d_cycQ);
+        bool should_continue = solve_from_kl(d_C, d_X, d_U, d_V, n, d_B, d_R, d_Q, k, l, d_col_to_row, d_indices, d_row_start, d_row_count, d_counter, d_row_visited,  d_next_i, d_next_j, d_parity, d_fR, d_fQ, d_hasPredR, d_hasPredQ, d_cycR, d_cycQ, d_active_rows, d_next_rows);
         steps++;
         if (!should_continue) {
             // std::cout << "Solver has converged after " << steps << " steps.\n";
@@ -1621,6 +2034,9 @@ void solve(float* d_C, int* d_X, float* d_U, float* d_V, int n) {
     cudaFree(d_fR); cudaFree(d_fQ);
     cudaFree(d_hasPredR); cudaFree(d_hasPredQ);
     cudaFree(d_cycR); cudaFree(d_cycQ);
+
+    cudaFree(d_active_rows);
+    cudaFree(d_next_rows);
 }
 
 
