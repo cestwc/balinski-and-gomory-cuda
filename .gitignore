@@ -5,6 +5,9 @@
 *.cubin
 *.fatbin
 
+*.sqlite
+*.nsys-rep
+
 # Build folders
 /build/
 /bin/
