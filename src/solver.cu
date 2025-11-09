@@ -1746,6 +1746,45 @@ __global__ void solve_1bc_sparse_indices_1D(
     }
 }
 
+__global__ void solve_1bc_sparse_single_block(
+    int n,
+    const int* __restrict__ d_col_to_row,
+    const int* __restrict__ d_indices,
+    const int* __restrict__ d_count,
+    int* __restrict__ k,
+    int* __restrict__ l,
+    const float* __restrict__ B,
+    int* __restrict__ R,
+    int* __restrict__ Q)
+{
+    __shared__ int block_changed;
+    int num_indices = *d_count;
+
+    while (true) {
+        if (threadIdx.x == 0)
+            block_changed = 0;
+        __syncthreads();
+
+        for (int idx = threadIdx.x; idx < num_indices; idx += blockDim.x) {
+            int flat = d_indices[idx];
+            int j = flat / n;
+            int i = flat % n;
+
+            if (i != *k && R[i] != n && Q[j] == n) {
+                if (atomicMin(&Q[j], i) == n) {
+                    block_changed = 1;
+                    R[d_col_to_row[j]] = j;
+                }
+            }
+        }
+
+        __syncthreads();
+        if (block_changed == 0)
+            break;  // no change, exit
+    }
+}
+
+
 bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d_B, int* d_R, int* d_Q, int* k, int* l,int* d_col_to_row, int* d_indices, int* d_row_start, int* d_row_count, int* d_counter, int* d_row_visited, int* d_next_i, int* d_next_j, int* d_parity, int* d_fR, int* d_fQ, unsigned char* d_hasPredR, unsigned char* d_hasPredQ, unsigned char* d_cycR, unsigned char* d_cycQ, int* d_active_rows, int* d_next_rows, int* d_count, int* d_selected, int* d_num_selected, void* d_temp_storage, size_t temp_bytes) {
     dim3 threads(16, 16);
     dim3 blocks((n + threads.x - 1) / threads.x, (n + threads.y - 1) / threads.y);
@@ -1801,7 +1840,16 @@ bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d
     selectZerosOptimized(d_B, d_indices, d_count, n * n);
     // printDeviceVector("d_indices", d_indices, n*n);
 
-    int blockSize = 256;
+    if (n <= 1200) {
+        //------------------------------------------------------
+        // Very sparse case — single block kernel
+        //------------------------------------------------------
+        int blockSize = 1024;
+        solve_1bc_sparse_single_block<<<1, blockSize>>>(
+            n, d_col_to_row, d_indices, d_count, k, l, d_B, d_R, d_Q);
+        cudaDeviceSynchronize();
+    } else {
+        int blockSize = 256;
     int numBlocks = 256;  // tune as needed per GPU and problem size
 
     void* args[] = {
@@ -1812,6 +1860,8 @@ bool solve_from_kl(float* d_C, int* d_X, float* d_U, float* d_V, int n, float* d
     cudaLaunchCooperativeKernel(
         (void*)solve_1bc_sparse_indices_1D,
         numBlocks, blockSize, args);
+    }
+
 
 
 
