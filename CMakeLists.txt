@@ -17,6 +17,8 @@ include_directories(${CMAKE_SOURCE_DIR}/src)
 set(SOLVER_SOURCES
     src/solver.cu
     src/solver.h
+    src/cuda_debug_utils.cu
+    src/cuda_debug_utils.cuh
 )
 
 add_executable(test1 src/test-random-float.cu ${SOLVER_SOURCES})
